@@ -1,7 +1,9 @@
+import json
+import os
 import re
 import time
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -9,7 +11,7 @@ from feedgen.feed import FeedGenerator
 
 
 # =========================================================
-# 基本设置
+# 配置
 # =========================================================
 
 BASE_URL = "https://t66y.com/"
@@ -21,17 +23,29 @@ LIST_URL = (
 
 TARGET_AUTHOR = "愛在黑夜"
 
-# 网站时间按 UTC+8 处理
-SITE_TZ = timezone(timedelta(hours=8))
+CACHE_FILE = "posts_cache.json"
+FEED_FILE = "feed.xml"
 
-# 页与页之间暂停
-PAGE_DELAY = 1.0
+# 目前确认至少有 47 页。
+# 如果网站以后变成 48、49……程序会自动识别更大的数字。
+MIN_TOTAL_PAGES = 47
 
-# 打开每篇帖子之间暂停
+SITE_TZ = timezone(
+    timedelta(hours=8)
+)
+
+# 列表页间隔
+PAGE_DELAY = 1.5
+
+# 进入帖子详情页的间隔
 POST_DELAY = 0.6
 
-# 防止网页异常导致无限翻页
-MAX_PAGES = 1000
+# 单页失败最多重试次数
+MAX_RETRIES = 5
+
+# None = RSS 中保留全部帖子
+# 如果以后 feed.xml 太大，可以改成 500 / 1000
+RSS_MAX_ITEMS = None
 
 
 # =========================================================
@@ -51,15 +65,13 @@ session.headers.update({
 
 
 def get_soup(url, retries=3):
-    """
-    请求网页，失败自动重试。
-    """
 
     last_error = None
 
     for attempt in range(1, retries + 1):
 
         try:
+
             print(f"请求：{url}")
 
             r = session.get(
@@ -69,8 +81,12 @@ def get_soup(url, retries=3):
 
             r.raise_for_status()
 
-            # 自动判断网页编码
-            r.encoding = r.apparent_encoding
+            if (
+                not r.encoding
+                or r.encoding.lower()
+                == "iso-8859-1"
+            ):
+                r.encoding = r.apparent_encoding
 
             return BeautifulSoup(
                 r.text,
@@ -82,57 +98,223 @@ def get_soup(url, retries=3):
             last_error = e
 
             print(
-                f"请求失败，第 {attempt}/{retries} 次：",
-                e
+                f"请求失败 "
+                f"{attempt}/{retries}：{e}"
             )
 
-            time.sleep(3 * attempt)
+            time.sleep(
+                3 * attempt
+            )
 
     raise last_error
 
 
 # =========================================================
-# URL
+# 缓存
 # =========================================================
 
-def make_page_url(page):
-    """
-    生成搜索结果分页地址。
-    """
+def load_cache():
 
-    if page == 1:
-        return LIST_URL
+    if not os.path.exists(
+        CACHE_FILE
+    ):
 
-    return (
-        "https://t66y.com/thread0806.php"
-        f"?fid=2&search=219675&page={page}"
+        print(
+            "没有历史缓存："
+            "本次为第一次全量抓取。"
+        )
+
+        return {}
+
+    try:
+
+        with open(
+            CACHE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            data = json.load(f)
+
+        if not isinstance(
+            data,
+            dict
+        ):
+            return {}
+
+        print(
+            f"已读取缓存："
+            f"{len(data)} 篇"
+        )
+
+        return data
+
+    except Exception as e:
+
+        print(
+            "缓存读取失败：",
+            e
+        )
+
+        return {}
+
+
+def save_cache(cache):
+
+    temp_file = (
+        CACHE_FILE + ".tmp"
+    )
+
+    with open(
+        temp_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            cache,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    os.replace(
+        temp_file,
+        CACHE_FILE
+    )
+
+    print(
+        f"缓存已保存："
+        f"{len(cache)} 篇"
     )
 
 
 # =========================================================
-# 获取列表页主题
+# 分页
+# =========================================================
+
+def make_page_url(page):
+
+    if page == 1:
+        return LIST_URL
+
+    # 按网站分页链接的参数顺序
+    return (
+        "https://t66y.com/thread0806.php"
+        f"?fid=2&page={page}&search=219675"
+    )
+
+
+def get_total_pages():
+
+    print()
+    print("正在检测总页数……")
+
+    pages = {1}
+
+    try:
+
+        soup = get_soup(
+            LIST_URL
+        )
+
+        for a in soup.find_all(
+            "a",
+            href=True
+        ):
+
+            try:
+
+                full_url = urljoin(
+                    BASE_URL,
+                    a["href"]
+                )
+
+                query = parse_qs(
+                    urlparse(
+                        full_url
+                    ).query
+                )
+
+                if (
+                    query.get(
+                        "fid",
+                        [""]
+                    )[0]
+                    != "2"
+                ):
+                    continue
+
+                if (
+                    query.get(
+                        "search",
+                        [""]
+                    )[0]
+                    != "219675"
+                ):
+                    continue
+
+                if "page" not in query:
+                    continue
+
+                page = int(
+                    query["page"][0]
+                )
+
+                if page >= 1:
+                    pages.add(page)
+
+            except Exception:
+                pass
+
+    except Exception as e:
+
+        print(
+            "自动检测页数失败：",
+            e
+        )
+
+    detected = max(pages)
+
+    total = max(
+        detected,
+        MIN_TOTAL_PAGES
+    )
+
+    print(
+        f"网页检测：{detected} 页"
+    )
+
+    print(
+        f"本次扫描：1～{total} 页"
+    )
+
+    return total
+
+
+# =========================================================
+# 列表页
 # =========================================================
 
 def get_posts_from_page(page):
-    """
-    获取某一页中的所有帖子。
-    """
 
-    url = make_page_url(page)
-
-    soup = get_soup(url)
+    soup = get_soup(
+        make_page_url(page)
+    )
 
     posts = []
-    seen = set()
+    page_seen = set()
 
     for a in soup.find_all(
         "a",
         href=True
     ):
 
-        href = a.get("href", "")
+        href = a.get(
+            "href",
+            ""
+        )
 
-        # T66Y 主题详情链接一般包含 htm_data
         if "htm_data" not in href:
             continue
 
@@ -144,108 +326,157 @@ def get_posts_from_page(page):
         if not title:
             continue
 
-        full_url = urljoin(
+        url = urljoin(
             BASE_URL,
             href
         )
 
-        # 防止一个帖子在 HTML 中出现多次
-        if full_url in seen:
+        if url in page_seen:
             continue
 
-        seen.add(full_url)
-
-        # 如果能找到所在表格行，就检查作者
-        row = a.find_parent("tr")
-
-        if row:
-            row_text = row.get_text(
-                " ",
-                strip=True
-            )
-
-            # 当前 search 本身已经是作者搜索，
-            # 但仍多做一次校验。
-            if (
-                TARGET_AUTHOR
-                and TARGET_AUTHOR not in row_text
-            ):
-                continue
+        page_seen.add(url)
 
         posts.append({
             "title": title,
-            "url": full_url
+            "url": url
         })
 
     return posts
 
 
-# =========================================================
-# 自动遍历所有分页
-# =========================================================
+def fetch_list_page(
+    page,
+    previous_signature=None
+):
 
-def collect_post_links():
-    """
-    从第一页一直抓到最后一页。
-
-    不依赖网页上只显示几个页码，
-    而是不断尝试下一页。
-    当某一页已经没有主题时停止。
-    """
-
-    all_posts = []
-
-    seen_urls = set()
-
-    page = 1
-
-    while page <= MAX_PAGES:
-
-        print()
-        print(
-            "======================================"
-        )
-        print(f"正在读取列表第 {page} 页")
-        print(
-            "======================================"
-        )
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1
+    ):
 
         try:
 
-            posts = get_posts_from_page(
-                page
+            posts = (
+                get_posts_from_page(
+                    page
+                )
             )
+
+            if not posts:
+
+                print(
+                    f"⚠️ 第 {page} 页返回 0 条，"
+                    f"重试 {attempt}/{MAX_RETRIES}"
+                )
+
+                time.sleep(
+                    attempt * 5
+                )
+
+                continue
+
+            signature = tuple(
+                p["url"]
+                for p in posts
+            )
+
+            if (
+                previous_signature
+                and signature
+                == previous_signature
+            ):
+
+                print(
+                    f"⚠️ 第 {page} 页疑似返回"
+                    "上一页内容，重新请求。"
+                )
+
+                time.sleep(
+                    attempt * 5
+                )
+
+                continue
+
+            return posts, signature
 
         except Exception as e:
 
             print(
-                f"第 {page} 页读取失败：",
-                e
+                f"⚠️ 第 {page} 页失败 "
+                f"{attempt}/{MAX_RETRIES}：{e}"
             )
 
-            # 单页错误时先重试下一页不太安全，
-            # 所以这里停止，避免漏大量内容。
-            break
+            time.sleep(
+                attempt * 5
+            )
 
+    return None, None
+
+
+def collect_all_list_posts():
+
+    total_pages = (
+        get_total_pages()
+    )
+
+    all_posts = []
+    seen = set()
+
+    failed_pages = []
+
+    previous_signature = None
+
+    for page in range(
+        1,
+        total_pages + 1
+    ):
+
+        print()
         print(
-            f"这一页发现 {len(posts)} 个主题"
+            "=" * 55
         )
 
-        # 没有主题 = 已到最后一页
-        if not posts:
-            print(
-                "没有发现主题，认为已经到最后一页。"
+        print(
+            f"正在扫描 "
+            f"{page}/{total_pages} 页"
+        )
+
+        print(
+            "=" * 55
+        )
+
+        posts, signature = (
+            fetch_list_page(
+                page,
+                previous_signature
             )
-            break
+        )
+
+        if not posts:
+
+            print(
+                f"❌ 第 {page} 页暂时失败，"
+                "先继续下一页。"
+            )
+
+            failed_pages.append(
+                page
+            )
+
+            continue
+
+        previous_signature = (
+            signature
+        )
 
         new_count = 0
 
         for post in posts:
 
-            if post["url"] in seen_urls:
+            if post["url"] in seen:
                 continue
 
-            seen_urls.add(
+            seen.add(
                 post["url"]
             )
 
@@ -256,44 +487,157 @@ def collect_post_links():
             new_count += 1
 
         print(
-            f"新增 {new_count} 个主题"
+            f"第 {page} 页："
+            f"{len(posts)} 条，"
+            f"新增 {new_count} 条"
         )
 
-        # 防止服务器把最后一页重复返回
-        if new_count == 0:
-
-            print(
-                "这一页没有新的主题，停止翻页。"
-            )
-
-            break
-
-        page += 1
+        print(
+            f"累计："
+            f"{len(all_posts)} 条"
+        )
 
         time.sleep(
             PAGE_DELAY
         )
 
+    # -------------------------------
+    # 第二轮补抓失败页面
+    # -------------------------------
+
+    if failed_pages:
+
+        print()
+        print(
+            "需要补抓页面：",
+            failed_pages
+        )
+
+        time.sleep(10)
+
+        still_failed = []
+
+        for page in failed_pages:
+
+            posts, _ = (
+                fetch_list_page(
+                    page
+                )
+            )
+
+            if not posts:
+
+                still_failed.append(
+                    page
+                )
+
+                continue
+
+            for post in posts:
+
+                if post["url"] in seen:
+                    continue
+
+                seen.add(
+                    post["url"]
+                )
+
+                all_posts.append(
+                    post
+                )
+
+            print(
+                f"✓ 第 {page} 页补抓成功"
+            )
+
+            time.sleep(
+                PAGE_DELAY
+            )
+
+        if still_failed:
+
+            raise RuntimeError(
+                "以下页面经过两轮重试仍失败："
+                f"{still_failed}。"
+                "为了避免发布残缺 RSS，"
+                "本次停止更新。"
+            )
+
     print()
     print(
-        f"列表抓取结束，共找到 "
-        f"{len(all_posts)} 个不重复主题"
+        "=" * 55
+    )
+
+    print(
+        f"{total_pages} 页全部扫描完成"
+    )
+
+    print(
+        f"共发现 "
+        f"{len(all_posts)} 个帖子"
+    )
+
+    print(
+        "=" * 55
     )
 
     return all_posts
 
 
 # =========================================================
-# 解析真实发帖时间
+# 发布时间
 # =========================================================
 
-def parse_publish_time(soup):
+def infer_year_from_url(
+    post_url,
+    fallback_month
+):
     """
-    从详情页寻找楼主真实发帖时间。
+    例如：
+    htm_data/2609/2/xxxx.html
 
-    常见格式：
-    Posted: 09-19 13:52 樓主
+    2609 = 2026 年 09 月
     """
+
+    match = re.search(
+        r"htm_data/(\d{2})(\d{2})/",
+        post_url
+    )
+
+    if match:
+
+        year2 = int(
+            match.group(1)
+        )
+
+        url_month = int(
+            match.group(2)
+        )
+
+        if (
+            1 <= url_month <= 12
+        ):
+
+            return (
+                2000 + year2
+            )
+
+    now = datetime.now(
+        SITE_TZ
+    )
+
+    year = now.year
+
+    if fallback_month > now.month:
+        year -= 1
+
+    return year
+
+
+def parse_publish_time(
+    soup,
+    post_url
+):
 
     text = soup.get_text(
         " ",
@@ -334,15 +678,14 @@ def parse_publish_time(soup):
         match.groups()
     )
 
-    now = datetime.now(
-        SITE_TZ
+    year = infer_year_from_url(
+        post_url,
+        month
     )
-
-    year = now.year
 
     try:
 
-        dt = datetime(
+        return datetime(
             year,
             month,
             day,
@@ -355,37 +698,19 @@ def parse_publish_time(soup):
 
         return None
 
-    # 解决跨年问题
-    #
-    # 例如现在是 2027-01-02
-    # 网页写 12-30
-    # 那应该是 2026-12-30
-    if dt > now:
-
-        try:
-            dt = dt.replace(
-                year=year - 1
-            )
-
-        except ValueError:
-            pass
-
-    return dt
-
 
 # =========================================================
-# 清理正文
+# 正文
 # =========================================================
 
-def clean_content(node, post_url):
-    """
-    清理正文 HTML，并修复图片地址。
-    """
+def clean_content(
+    node,
+    post_url
+):
 
-    if node is None:
+    if not node:
         return ""
 
-    # 删除脚本 / 样式等
     for bad in node.find_all([
         "script",
         "style",
@@ -395,29 +720,31 @@ def clean_content(node, post_url):
 
         bad.decompose()
 
-    # 修复图片地址
-    for img in node.find_all("img"):
+    for img in node.find_all(
+        "img"
+    ):
 
-        src = img.get("src")
-
-        if not src:
-            continue
-
-        img["src"] = urljoin(
-            post_url,
-            src
+        src = img.get(
+            "src"
         )
 
-        # 清除可能造成阅读器问题的属性
+        if src:
+
+            img["src"] = urljoin(
+                post_url,
+                src
+            )
+
         for attr in [
             "onclick",
             "onload"
         ]:
 
-            if attr in img.attrs:
-                del img.attrs[attr]
+            img.attrs.pop(
+                attr,
+                None
+            )
 
-    # 修复正文里的链接
     for a in node.find_all(
         "a",
         href=True
@@ -431,21 +758,12 @@ def clean_content(node, post_url):
     return str(node)
 
 
-# =========================================================
-# 抓取楼主正文
-# =========================================================
-
 def find_main_content(
     soup,
     post_url
 ):
-    """
-    优先寻找 T66Y 老论坛常见楼主正文节点。
-    """
 
-    candidates = []
-
-    # T66Y 常见正文 ID
+    # 优先找楼主正文
     for element_id in [
         "read_tpc",
         "read_tpc_0"
@@ -456,190 +774,250 @@ def find_main_content(
         )
 
         if node:
-            candidates.append(
-                node
+
+            return clean_content(
+                node,
+                post_url
             )
 
-    # 常见 class
-    if not candidates:
+    selectors = [
+        ".tpc_content",
+        ".post_content",
+        ".post-content"
+    ]
 
-        for class_pattern in [
-            r"\btpc_content\b",
-            r"\btpc\b",
-            r"\bpost_content\b",
-            r"\bpost-content\b"
-        ]:
+    for selector in selectors:
 
-            nodes = soup.find_all(
-                ["div", "td"],
-                class_=re.compile(
-                    class_pattern,
-                    re.I
-                )
+        node = soup.select_one(
+            selector
+        )
+
+        if node:
+
+            return clean_content(
+                node,
+                post_url
             )
-
-            if nodes:
-                candidates.extend(
-                    nodes
-                )
-                break
-
-    if candidates:
-
-        # 通常第一个就是楼主正文
-        return clean_content(
-            candidates[0],
-            post_url
-        )
-
-    # 最后的退路：
-    # 找文本量最大的 td/div
-    best_node = None
-    best_length = 0
-
-    for node in soup.find_all(
-        ["td", "div"]
-    ):
-
-        text = node.get_text(
-            " ",
-            strip=True
-        )
-
-        length = len(text)
-
-        if length > best_length:
-
-            # 排除明显整页容器
-            if length < 100000:
-
-                best_length = length
-                best_node = node
-
-    if best_node:
-
-        return clean_content(
-            best_node,
-            post_url
-        )
 
     return ""
 
 
 # =========================================================
-# 抓取详情
+# 单篇帖子详情
 # =========================================================
 
-def parse_post_detail(post):
-    """
-    获取：
-    - 发布时间
-    - 楼主正文
-    """
-
-    url = post["url"]
+def fetch_post_detail(post):
 
     try:
 
         soup = get_soup(
-            url
+            post["url"]
         )
 
-        published = parse_publish_time(
-            soup
+        published = (
+            parse_publish_time(
+                soup,
+                post["url"]
+            )
         )
 
-        content = find_main_content(
-            soup,
-            url
+        content = (
+            find_main_content(
+                soup,
+                post["url"]
+            )
         )
 
         if not content:
 
             content = (
                 "<p>"
-                "正文抓取失败，请打开原帖查看。"
+                "正文未能自动提取，"
+                "请打开原帖查看。"
                 "</p>"
             )
 
         return {
-            **post,
-            "published": published,
-            "content": content
+            "title": post["title"],
+            "url": post["url"],
+
+            "published": (
+                published.isoformat()
+                if published
+                else None
+            ),
+
+            "content": content,
+
+            # 页面请求本身成功
+            "ok": True
         }
 
     except Exception as e:
 
         print(
-            "读取主题失败：",
-            post["title"],
-            e
+            f"⚠️ 帖子详情失败："
+            f"{post['title']}：{e}"
         )
 
         return {
-            **post,
+            "title": post["title"],
+            "url": post["url"],
             "published": None,
-            "content": (
-                "<p>"
-                "正文暂时抓取失败。"
-                "</p>"
-            )
+            "content": "",
+            "ok": False
         }
 
 
 # =========================================================
-# 抓所有详情
+# 增量更新
 # =========================================================
 
-def collect_all_posts():
-    """
-    获取全部主题及正文。
-    """
+def update_cache(
+    list_posts,
+    cache
+):
 
-    basic_posts = collect_post_links()
+    # 先刷新已有项目的标题
+    for post in list_posts:
 
-    result = []
+        url = post["url"]
+
+        if url in cache:
+
+            cache[url]["title"] = (
+                post["title"]
+            )
+
+    needs_fetch = []
+
+    for post in list_posts:
+
+        url = post["url"]
+
+        # 从没抓过
+        if url not in cache:
+
+            needs_fetch.append(
+                post
+            )
+
+            continue
+
+        # 以前详情抓取失败，重新尝试
+        if not cache[url].get(
+            "ok",
+            False
+        ):
+
+            needs_fetch.append(
+                post
+            )
+
+    print()
+    print(
+        "=" * 55
+    )
+
+    print(
+        f"缓存中已有："
+        f"{len(cache)} 篇"
+    )
+
+    print(
+        f"本次列表发现："
+        f"{len(list_posts)} 篇"
+    )
+
+    print(
+        f"需要进入详情页抓取："
+        f"{len(needs_fetch)} 篇"
+    )
+
+    print(
+        "=" * 55
+    )
+
+    # -------------------------------
+    # 第一次：
+    # needs_fetch 会是几千篇
+    #
+    # 以后：
+    # 一般只会是 0、1、2……
+    # -------------------------------
 
     total = len(
-        basic_posts
+        needs_fetch
     )
 
     for index, post in enumerate(
-        basic_posts,
+        needs_fetch,
         start=1
     ):
 
         print()
         print(
-            f"[{index}/{total}] "
+            f"[详情 {index}/{total}] "
             f"{post['title']}"
         )
 
-        detail = parse_post_detail(
-            post
+        detail = (
+            fetch_post_detail(
+                post
+            )
         )
 
-        result.append(
-            detail
-        )
+        cache[
+            post["url"]
+        ] = detail
+
+        # 每抓 20 篇在本地保存一次
+        # 防止脚本后面出错时内存中的进度全部丢失
+        if index % 20 == 0:
+
+            save_cache(
+                cache
+            )
 
         time.sleep(
             POST_DELAY
         )
 
-    return result
+    save_cache(
+        cache
+    )
+
+    return cache
 
 
 # =========================================================
 # RSS
 # =========================================================
 
-def generate_rss(posts):
+def parse_cached_datetime(
+    value
+):
 
-    # 只让带时间的正常参与排序
-    #
-    # timezone-aware datetime 与
-    # timezone-aware datetime 比较。
+    if not value:
+        return None
+
+    try:
+
+        return datetime.fromisoformat(
+            value
+        )
+
+    except Exception:
+
+        return None
+
+
+def generate_rss(cache):
+
+    items = list(
+        cache.values()
+    )
+
     minimum_time = datetime(
         1970,
         1,
@@ -647,13 +1025,23 @@ def generate_rss(posts):
         tzinfo=SITE_TZ
     )
 
-    posts.sort(
+    items.sort(
         key=lambda item: (
-            item.get("published")
+            parse_cached_datetime(
+                item.get(
+                    "published"
+                )
+            )
             or minimum_time
         ),
         reverse=True
     )
+
+    if RSS_MAX_ITEMS:
+
+        items = items[
+            :RSS_MAX_ITEMS
+        ]
 
     fg = FeedGenerator()
 
@@ -671,22 +1059,31 @@ def generate_rss(posts):
     )
 
     fg.description(
-        f"{TARGET_AUTHOR} 的帖子 RSS，"
-        "包含楼主正文，并按照真实发布时间倒序排列。"
+        f"{TARGET_AUTHOR} 的 RSS，"
+        "包含楼主正文并按真实发布时间排序。"
     )
 
     fg.language(
         "zh-CN"
     )
 
-    # RSS 自身最后更新时间
     fg.lastBuildDate(
         datetime.now(
             SITE_TZ
         )
     )
 
-    for post in posts:
+    added = 0
+
+    for post in items:
+
+        # 连详情页都没抓成功的，
+        # 暂时不放进 RSS。
+        if not post.get(
+            "ok",
+            False
+        ):
+            continue
 
         fe = fg.add_entry()
 
@@ -712,13 +1109,16 @@ def generate_rss(posts):
             "name": TARGET_AUTHOR
         })
 
-        published = post.get(
-            "published"
+        published = (
+            parse_cached_datetime(
+                post.get(
+                    "published"
+                )
+            )
         )
 
-        if published is not None:
+        if published:
 
-            # 此处现在一定包含 +08:00 时区
             fe.pubDate(
                 published
             )
@@ -728,7 +1128,6 @@ def generate_rss(posts):
             ""
         )
 
-        # description 直接放完整正文
         fe.description(
             content
             +
@@ -739,23 +1138,25 @@ def generate_rss(posts):
             "</a></p>"
         )
 
+        added += 1
+
     fg.rss_file(
-        "feed.xml",
+        FEED_FILE,
         pretty=True
     )
 
     print()
     print(
-        "======================================"
+        "=" * 55
     )
+
     print(
-        f"RSS 生成成功，共 {len(posts)} 篇"
+        f"RSS 已生成："
+        f"{added} 篇"
     )
+
     print(
-        "文件：feed.xml"
-    )
-    print(
-        "======================================"
+        "=" * 55
     )
 
 
@@ -765,22 +1166,34 @@ def generate_rss(posts):
 
 def main():
 
-    print()
     print(
-        "开始更新 T66Y RSS"
+        "开始更新 RSS"
     )
 
-    posts = collect_all_posts()
+    # 1. 读取过去已经抓过的内容
+    cache = load_cache()
 
-    if not posts:
+    # 2. 每次仍然完整扫描全部 47+ 个列表页
+    list_posts = (
+        collect_all_list_posts()
+    )
+
+    if not list_posts:
 
         raise RuntimeError(
-            "没有抓取到任何帖子，"
-            "为避免覆盖现有 RSS，停止生成。"
+            "没有抓到任何列表内容，"
+            "停止更新。"
         )
 
+    # 3. 只有新帖子才进入详情页
+    cache = update_cache(
+        list_posts,
+        cache
+    )
+
+    # 4. 用历史缓存 + 新增内容生成 RSS
     generate_rss(
-        posts
+        cache
     )
 
 
