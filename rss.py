@@ -1,8 +1,8 @@
 import json
 import os
 import re
-import shutil
 import time
+
 from datetime import datetime, timezone, timedelta
 from urllib.parse import (
     urljoin,
@@ -58,33 +58,21 @@ DATA_DIR = "data"
 # 真正的新帖子不占这 450 篇额度。
 GLOBAL_BACKFILL_BATCH_SIZE = 450
 
-# 网站时间
 SITE_TZ = timezone(
     timedelta(hours=8)
 )
 
-# 列表页请求间隔
 PAGE_DELAY = 1.0
-
-# 详情页请求间隔
 POST_DELAY = 1.0
 
-# 每处理多少篇详情页额外休息一次
 DETAIL_PAUSE_EVERY = 50
-
-# 额外休息秒数
 DETAIL_PAUSE_SECONDS = 8
 
-# 列表页最大重试次数
 MAX_LIST_RETRIES = 5
-
-# 普通详情页跨运行最大失败次数
 MAX_DETAIL_FAILURES = 3
-
-# 连续出现几个 403 就认为网站可能正在限流
 MAX_CONSECUTIVE_403 = 3
 
-# None = RSS 保存全部帖子
+# None = RSS 保留全部帖子
 RSS_MAX_ITEMS = None
 
 
@@ -119,19 +107,7 @@ class SourceScanError(Exception):
     pass
 
 
-def get_soup(
-    url,
-    retries=3
-):
-    """
-    获取网页。
-
-    403：
-    不在同一次请求中不断重试。
-
-    普通网络错误：
-    最多有限重试。
-    """
+def get_soup(url, retries=3):
 
     last_error = None
 
@@ -196,7 +172,7 @@ def get_soup(
 
 
 # =========================================================
-# 文件名 / 路径
+# 文件路径
 # =========================================================
 
 def safe_name(name):
@@ -243,12 +219,6 @@ def source_paths(source):
 
 
 def ensure_source_dir(source):
-    """
-    确保分类目录存在。
-
-    .gitkeep 可以保证即使某个分类本轮抓取失败，
-    GitHub 也能看到这个目录。
-    """
 
     paths = source_paths(
         source
@@ -259,80 +229,7 @@ def ensure_source_dir(source):
         exist_ok=True
     )
 
-    gitkeep = os.path.join(
-        paths["dir"],
-        ".gitkeep"
-    )
-
-    if not os.path.exists(
-        gitkeep
-    ):
-
-        with open(
-            gitkeep,
-            "w",
-            encoding="utf-8"
-        ):
-            pass
-
     return paths
-
-
-# =========================================================
-# 兼容旧版亚洲无码原创区
-# =========================================================
-
-def maybe_migrate_legacy_asia(source):
-
-    if (
-        source["id"]
-        != "asia_uncensored_original"
-    ):
-        return
-
-    paths = ensure_source_dir(
-        source
-    )
-
-    # 旧 posts_cache.json
-    if (
-        not os.path.exists(
-            paths["cache"]
-        )
-        and os.path.exists(
-            "posts_cache.json"
-        )
-    ):
-
-        print(
-            "发现旧 posts_cache.json，"
-            "自动迁移到亚洲无码原创区。"
-        )
-
-        shutil.copy2(
-            "posts_cache.json",
-            paths["cache"]
-        )
-
-    # 旧 rss_state.json
-    if (
-        not os.path.exists(
-            paths["state"]
-        )
-        and os.path.exists(
-            "rss_state.json"
-        )
-    ):
-
-        print(
-            "发现旧 rss_state.json，"
-            "自动迁移到亚洲无码原创区。"
-        )
-
-        shutil.copy2(
-            "rss_state.json",
-            paths["state"]
-        )
 
 
 # =========================================================
@@ -483,7 +380,6 @@ def normalize_cache(cache):
             "status"
         )
 
-        # 兼容旧 retry
         if status == "retry":
 
             item["status"] = (
@@ -496,7 +392,6 @@ def normalize_cache(cache):
 
             continue
 
-        # 兼容旧 blocked
         if item.get(
             "blocked"
         ):
@@ -507,7 +402,6 @@ def normalize_cache(cache):
 
             continue
 
-        # 兼容旧 ok
         if (
             item.get("ok")
             is True
@@ -519,10 +413,8 @@ def normalize_cache(cache):
             )
 
             if (
-                "历史索引"
-                in content
-                or "等待抓取"
-                in content
+                "历史索引" in content
+                or "等待抓取" in content
                 or not content
             ):
 
@@ -694,7 +586,7 @@ def make_page_url(
 
 
 # =========================================================
-# 判断分页是不是当前分类
+# 判断分页是否属于当前分类
 # =========================================================
 
 def same_source_query(
@@ -879,7 +771,6 @@ def get_posts_from_page(
             ""
         )
 
-        # 只读取主题详情
         if "htm_data" not in href:
 
             continue
@@ -916,12 +807,6 @@ def get_posts_from_page(
 
 # =========================================================
 # 列表页请求
-#
-# allow_empty=True：
-# 当前最后一页允许为空。
-#
-# 用于解决欧美原创区：
-# 第23页存在分页，但实际上是空尾页。
 # =========================================================
 
 def fetch_list_page(
@@ -945,16 +830,15 @@ def fetch_list_page(
                 )
             )
 
-            # 空页面
             if not posts:
 
-                # 当前最后一页允许为空
+                # 最后一页允许是空尾页
                 if allow_empty:
 
                     print(
                         f"[{source['name']}] "
                         f"第 {page} 页为空，"
-                        "但这是当前最后一页，"
+                        "这是最后一页，"
                         "视为正常空尾页。"
                     )
 
@@ -981,7 +865,6 @@ def fetch_list_page(
                 for post in posts
             )
 
-            # 防止网站错误返回上一页
             if (
                 previous_signature
                 and signature
@@ -1063,8 +946,6 @@ def collect_all_list_posts(source):
         total_pages + 1
     ):
 
-        print()
-
         print(
             f"[{source['name']}] "
             f"正在扫描 "
@@ -1097,7 +978,7 @@ def collect_all_list_posts(source):
 
             continue
 
-        # [] = 合法空尾页
+        # [] = 正常空尾页
         if len(posts) == 0:
 
             print(
@@ -1145,7 +1026,7 @@ def collect_all_list_posts(source):
         )
 
     # =====================================================
-    # 第二轮补抓失败页
+    # 第二轮补抓真正失败的页面
     # =====================================================
 
     if failed_pages:
@@ -1173,7 +1054,6 @@ def collect_all_list_posts(source):
                 )
             )
 
-            # 真失败
             if posts is None:
 
                 still_failed.append(
@@ -1182,13 +1062,12 @@ def collect_all_list_posts(source):
 
                 continue
 
-            # 合法空尾页
             if len(posts) == 0:
 
                 print(
                     f"[{source['name']}] "
-                    f"第 {page} 页是空尾页，"
-                    "补抓阶段也视为成功。"
+                    f"第 {page} 页为空尾页，"
+                    "补抓阶段视为成功。"
                 )
 
                 continue
@@ -1234,19 +1113,13 @@ def collect_all_list_posts(source):
 
 
 # =========================================================
-# 根据 URL 判断年份
+# 从 URL 推断年份
 # =========================================================
 
 def infer_year_from_url(
     post_url,
     fallback_month
 ):
-
-    # 例如：
-    #
-    # htm_data/2403/...
-    #
-    # 2403 = 2024年03月
 
     match = re.search(
         r"htm_data/"
@@ -1284,7 +1157,7 @@ def infer_year_from_url(
 
 
 # =========================================================
-# 真实发帖时间
+# 真实发布时间
 # =========================================================
 
 def parse_publish_time(
@@ -1303,7 +1176,6 @@ def parse_publish_time(
             r"(\d{2})-(\d{2})\s+"
             r"(\d{2}):(\d{2})"
         ),
-
         (
             r"發表於[:：]?\s*"
             r"(\d{2})-(\d{2})\s+"
@@ -1356,7 +1228,7 @@ def parse_publish_time(
 
 
 # =========================================================
-# 正文清理
+# 正文
 # =========================================================
 
 def clean_content(
@@ -1379,7 +1251,6 @@ def clean_content(
 
         bad.decompose()
 
-    # 图片变绝对 URL
     for img in node.find_all(
         "img"
     ):
@@ -1405,7 +1276,6 @@ def clean_content(
             None
         )
 
-    # 链接变绝对 URL
     for a in node.find_all(
         "a",
         href=True
@@ -1424,7 +1294,6 @@ def find_main_content(
     post_url
 ):
 
-    # 常见楼主正文 ID
     for element_id in (
         "read_tpc",
         "read_tpc_0",
@@ -1441,7 +1310,6 @@ def find_main_content(
                 post_url
             )
 
-    # 备用 class
     for selector in (
         ".tpc_content",
         ".post_content",
@@ -1561,7 +1429,7 @@ def make_index_item(post):
 
 
 # =========================================================
-# 列表同步到缓存
+# 列表同步进缓存
 # =========================================================
 
 def sync_list_to_cache(
@@ -1576,7 +1444,6 @@ def sync_list_to_cache(
 
         url = post["url"]
 
-        # 已经存在
         if url in cache:
 
             cache[url][
@@ -1589,8 +1456,7 @@ def sync_list_to_cache(
 
             continue
 
-        # 第一次建立基准：
-        # 当前已有内容全部按历史处理
+        # 第一次初始化
         if baseline_mode:
 
             cache[url] = (
@@ -1601,8 +1467,7 @@ def sync_list_to_cache(
 
             continue
 
-        # 后续新出现的 URL
-        # 才是真正的新帖
+        # 真正的新帖子
         cache[url] = {
             "title": post["title"],
             "url": url,
@@ -1808,10 +1673,6 @@ def prepare_source(
     total_pages
 ):
 
-    maybe_migrate_legacy_asia(
-        source
-    )
-
     cache = load_cache(
         source
     )
@@ -1827,8 +1688,8 @@ def prepare_source(
         )
     )
 
-    # 第一次运行或缓存为空，
-    # 当前列表全部建立为历史基准。
+    # 第一次运行：
+    # 当前已有内容全部作为历史基准
     baseline_mode = (
         not initialized
         or not cache
@@ -1886,7 +1747,8 @@ def prepare_source(
 
 
 # =========================================================
-# 第一优先级：所有新帖
+# 第一优先级：
+# 所有新帖子
 # =========================================================
 
 def process_new_posts(context):
@@ -1965,7 +1827,6 @@ def process_new_posts(context):
 
             consecutive_403 = 0
 
-        # 新帖频繁保存
         if (
             index % 10
             == 0
@@ -2007,7 +1868,7 @@ def process_new_posts(context):
 
 
 # =========================================================
-# RSS 时间
+# RSS 时间解析
 # =========================================================
 
 def parse_cached_datetime(value):
@@ -2038,7 +1899,7 @@ def parse_cached_datetime(value):
 # =========================================================
 # 历史补抓优先级
 #
-# 越新的历史帖子越优先。
+# 越新的帖子越优先
 # =========================================================
 
 def history_priority(
@@ -2047,7 +1908,7 @@ def history_priority(
     position
 ):
 
-    # 已经知道真实发布时间
+    # 如果已经有真实时间
     published = (
         parse_cached_datetime(
             item.get(
@@ -2065,7 +1926,7 @@ def history_priority(
             -position,
         )
 
-    # 从 URL 判断年月
+    # 从 URL 中读取 YYMM
     match = re.search(
         r"htm_data/"
         r"(\d{2})(\d{2})/",
@@ -2111,8 +1972,6 @@ def history_priority(
             rough_timestamp = 0
 
     # URL 最后的帖子 ID
-    # 通常更大的 ID 更新，
-    # 用于同月份之间进一步排序。
     post_id = 0
 
     id_match = re.search(
@@ -2143,14 +2002,11 @@ def history_priority(
 # =========================================================
 # 全局历史补抓
 #
-# 三个分类共享450篇额度。
+# 三个分类共享 450 篇额度
 #
-# 不固定：
-# 亚洲150 / 欧美150 / 国产150
+# 自动动态分配
 #
-# 而是：
-# 三个分类所有历史帖子放在一起，
-# 越新的越优先。
+# 越新的历史帖子越优先
 # =========================================================
 
 def process_global_history_backfill(
@@ -2159,10 +2015,7 @@ def process_global_history_backfill(
 
     candidates = []
 
-    # =====================================================
-    # 收集三个分类所有历史待补项目
-    # =====================================================
-
+    # 收集三个分类全部待补历史
     for context in contexts:
 
         source = context[
@@ -2212,10 +2065,7 @@ def process_global_history_backfill(
                 ),
             })
 
-    # =====================================================
-    # 全局最新 -> 最旧
-    # =====================================================
-
+    # 最新 -> 最旧
     candidates.sort(
         key=lambda item: (
             item["priority"]
@@ -2243,10 +2093,7 @@ def process_global_history_backfill(
         f"{GLOBAL_BACKFILL_BATCH_SIZE} 篇"
     )
 
-    # =====================================================
-    # 显示本轮动态分配结果
-    # =====================================================
-
+    # 显示动态分配
     allocation = {}
 
     for task in tasks:
@@ -2277,10 +2124,6 @@ def process_global_history_backfill(
     print(
         "=" * 70
     )
-
-    # =====================================================
-    # 开始补抓
-    # =====================================================
 
     consecutive_403 = 0
 
@@ -2353,7 +2196,6 @@ def process_global_history_backfill(
 
             consecutive_403 = 0
 
-        # 每分类处理20篇保存一次
         if (
             source_counts[name]
             % 20
@@ -2365,7 +2207,6 @@ def process_global_history_backfill(
                 cache
             )
 
-        # 连续403停止整个历史阶段
         if (
             consecutive_403
             >= MAX_CONSECUTIVE_403
@@ -2387,7 +2228,7 @@ def process_global_history_backfill(
             index
         )
 
-    # 最后保存全部分类
+    # 最后保存三个分类
     for context in contexts:
 
         save_cache(
@@ -2430,10 +2271,7 @@ def generate_rss(context):
         tzinfo=SITE_TZ
     )
 
-    # =====================================================
-    # 每次重新按照真实发布时间倒序排列
-    # =====================================================
-
+    # 按真实发布时间倒序
     items.sort(
         key=lambda item: (
             parse_cached_datetime(
@@ -2622,23 +2460,6 @@ def generate_rss(context):
         f"{paths['feed']}"
     )
 
-    # =====================================================
-    # 兼容旧 RSS 地址
-    #
-    # 根目录 feed.xml
-    # 继续同步亚洲无码原创区
-    # =====================================================
-
-    if (
-        source["id"]
-        == "asia_uncensored_original"
-    ):
-
-        shutil.copy2(
-            paths["feed"],
-            "feed.xml"
-        )
-
 
 # =========================================================
 # MAIN
@@ -2650,10 +2471,7 @@ def main():
         "开始更新多分类 RSS"
     )
 
-    # =====================================================
-    # 一开始先创建三个分类目录
-    # =====================================================
-
+    # 自动创建三个分类目录
     for source in SOURCES:
 
         ensure_source_dir(
@@ -2663,11 +2481,8 @@ def main():
     contexts = []
 
     # =====================================================
-    # 第一阶段
-    #
-    # 先扫描全部分类。
-    #
-    # 这样所有分类的新帖子都会先被发现。
+    # 第一阶段：
+    # 先扫描三个分类全部页面
     # =====================================================
 
     for source in SOURCES:
@@ -2721,11 +2536,8 @@ def main():
         )
 
     # =====================================================
-    # 第二阶段
-    #
-    # 三个分类所有新帖优先处理。
-    #
-    # 新帖不占历史450篇额度。
+    # 第二阶段：
+    # 三个分类所有新帖优先
     # =====================================================
 
     site_limited = False
@@ -2745,23 +2557,17 @@ def main():
             break
 
     # =====================================================
-    # 第三阶段
+    # 第三阶段：
     #
-    # 新帖全部完成后：
-    #
-    # 三个分类共享450篇历史额度。
-    #
-    # 自动动态分配。
-    #
-    # 谁的帖子更新，谁优先。
+    # 三个分类共享 450 篇历史补抓额度
+    # 自动动态分配
+    # 最新优先
     # =====================================================
 
     if not site_limited:
 
-        site_limited = (
-            process_global_history_backfill(
-                contexts
-            )
+        process_global_history_backfill(
+            contexts
         )
 
     else:
@@ -2772,9 +2578,8 @@ def main():
         )
 
     # =====================================================
-    # 第四阶段
-    #
-    # 三个分类分别生成 RSS
+    # 第四阶段：
+    # 分别生成三个 RSS
     # =====================================================
 
     for context in contexts:
