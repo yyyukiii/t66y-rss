@@ -1266,6 +1266,7 @@ def make_index_item(post):
         "title": post["title"],
         "url": post["url"],
         "published": None,
+        "rss_order_time": None,
 
         "content": (
             "<p>"
@@ -1276,6 +1277,141 @@ def make_index_item(post):
         "status": "index_only",
         "fail_count": 0,
     }
+
+
+# =========================================================
+# RSS 排版顺序时间
+#
+# RSS 阅读器通常会按照 pubDate 排序，而不是严格采用
+# XML 中 item 的物理顺序。这里为每篇文章保存一个稳定的
+# 排序时间，并保证它按照 Cache 顺序严格递减。
+# =========================================================
+
+def ensure_rss_order_times(cache):
+
+    items = list(
+        cache.values()
+    )
+
+    if not items:
+        return
+
+    now = datetime.now(
+        SITE_TZ
+    ).replace(
+        microsecond=0
+    )
+
+    parsed = [
+        parse_cached_datetime(
+            item.get(
+                "rss_order_time"
+            )
+        )
+        for item in items
+    ]
+
+    first_existing_index = next(
+        (
+            index
+            for index, value in enumerate(parsed)
+            if value is not None
+        ),
+        None,
+    )
+
+    # 第一次升级旧 Cache：
+    # 按当前排版顺序一次性建立稳定时间。
+    if first_existing_index is None:
+
+        for position, item in enumerate(items):
+
+            item["rss_order_time"] = (
+                now
+                - timedelta(
+                    seconds=position
+                )
+            ).isoformat()
+
+        return
+
+    # 新帖通常只会出现在 Cache 最前面。
+    # 给它们分配比原第一篇更晚的时间，
+    # 不改动已有文章的稳定时间。
+    if first_existing_index > 0:
+
+        first_existing = parsed[
+            first_existing_index
+        ]
+
+        anchor = max(
+            now,
+            first_existing
+            + timedelta(
+                seconds=first_existing_index
+            ),
+        )
+
+        for position in range(
+            first_existing_index
+        ):
+
+            items[position][
+                "rss_order_time"
+            ] = (
+                anchor
+                - timedelta(
+                    seconds=position
+                )
+            ).isoformat()
+
+    parsed = [
+        parse_cached_datetime(
+            item.get(
+                "rss_order_time"
+            )
+        )
+        for item in items
+    ]
+
+    strictly_descending = (
+        all(
+            value is not None
+            for value in parsed
+        )
+        and all(
+            parsed[index]
+            > parsed[index + 1]
+            for index in range(
+                len(parsed) - 1
+            )
+        )
+    )
+
+    if strictly_descending:
+        return
+
+    # 如果网站调整了旧帖排版位置，
+    # 重新建立整组排序时间，确保 XML 排版顺序优先。
+    valid_times = [
+        value
+        for value in parsed
+        if value is not None
+    ]
+
+    anchor = max(
+        [now]
+        + valid_times
+    )
+
+    for position, item in enumerate(items):
+
+        item["rss_order_time"] = (
+            anchor
+            - timedelta(
+                seconds=position
+            )
+        ).isoformat()
 
 
 # =========================================================
@@ -1342,6 +1478,7 @@ def sync_list_to_cache(
             "title": post["title"],
             "url": url,
             "published": None,
+            "rss_order_time": None,
 
             "content": (
                 "<p>"
@@ -1380,6 +1517,10 @@ def sync_list_to_cache(
         reordered_cache
     )
 
+    ensure_rss_order_times(
+        cache
+    )
+
     return new_count
 
 
@@ -1405,6 +1546,10 @@ def apply_detail_result(
         "published"
     )
 
+    old_rss_order_time = old_item.get(
+        "rss_order_time"
+    )
+
     old_content = old_item.get(
         "content",
         ""
@@ -1423,6 +1568,7 @@ def apply_detail_result(
                 )
                 or old_published
             ),
+            "rss_order_time": old_rss_order_time,
 
             "content": (
                 result.get(
@@ -1445,6 +1591,7 @@ def apply_detail_result(
             "url": url,
 
             "published": old_published,
+            "rss_order_time": old_rss_order_time,
 
             "content": (
                 "<p>"
@@ -1487,6 +1634,7 @@ def apply_detail_result(
         "title": post["title"],
         "url": url,
         "published": old_published,
+        "rss_order_time": old_rss_order_time,
 
         "content": (
             old_content
@@ -2137,10 +2285,11 @@ def generate_rss(context):
         source
     )
 
-    # 不再按照 published 重新排序。
+    # 不按照原帖 published 重新排序。
     #
     # Cache 当前是什么顺序，
-    # RSS 就是什么顺序。
+    # RSS 就是什么顺序；rss_order_time 会让
+    # 阅读器按照同样的顺序显示。
     items = list(
         cache.values()
     )
@@ -2171,7 +2320,8 @@ def generate_rss(context):
         f"{source['name']}："
         f"{TARGET_AUTHOR} 的帖子 RSS。"
         "RSS 顺序与 posts_cache.json "
-        "扫描顺序完全一致。"
+        "扫描顺序完全一致，并通过 "
+        "pubDate 锁定排版顺序。"
     )
 
     fg.language(
@@ -2221,14 +2371,24 @@ def generate_rss(context):
             "name": TARGET_AUTHOR
         })
 
-        published = parse_cached_datetime(
+        display_published = parse_cached_datetime(
             post.get(
-                "published"
+                "rss_order_time"
             )
         )
 
-        if published:
-            fe.pubDate(published)
+        if display_published is None:
+
+            raise RuntimeError(
+                f"[{source['name']}] "
+                f"缺少 RSS 排序时间：{url}"
+            )
+
+        # pubDate 专门用于锁定阅读器中的展示顺序。
+        # 原帖真实时间仍保存在 Cache 的 published 字段中。
+        fe.pubDate(
+            display_published
+        )
 
         status = post.get(
             "status",
