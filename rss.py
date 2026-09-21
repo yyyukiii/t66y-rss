@@ -52,11 +52,12 @@ TARGET_AUTHOR = "愛在黑夜"
 
 DATA_DIR = "data"
 
-# 三个分类共享：
-# 每轮最多补抓 450 篇历史正文。
-#
-# 真正的新帖子不占这 450 篇额度。
+# 每轮历史正文总共最多抓 450 篇
 GLOBAL_BACKFILL_BATCH_SIZE = 450
+
+# 每个还有历史待补内容的分类
+# 先保证最多 100 篇
+HISTORY_MIN_PER_SOURCE = 100
 
 SITE_TZ = timezone(
     timedelta(hours=8)
@@ -72,7 +73,7 @@ MAX_LIST_RETRIES = 5
 MAX_DETAIL_FAILURES = 3
 MAX_CONSECUTIVE_403 = 3
 
-# None = RSS 保留全部帖子
+# None = RSS 保存全部帖子
 RSS_MAX_ITEMS = None
 
 
@@ -832,7 +833,7 @@ def fetch_list_page(
 
             if not posts:
 
-                # 最后一页允许是空尾页
+                # 最后一页允许为空
                 if allow_empty:
 
                     print(
@@ -978,7 +979,7 @@ def collect_all_list_posts(source):
 
             continue
 
-        # [] = 正常空尾页
+        # [] = 合法空尾页
         if len(posts) == 0:
 
             print(
@@ -1026,7 +1027,7 @@ def collect_all_list_posts(source):
         )
 
     # =====================================================
-    # 第二轮补抓真正失败的页面
+    # 第二轮补抓失败页面
     # =====================================================
 
     if failed_pages:
@@ -1689,7 +1690,7 @@ def prepare_source(
     )
 
     # 第一次运行：
-    # 当前已有内容全部作为历史基准
+    # 当前已有内容全部作为历史
     baseline_mode = (
         not initialized
         or not cache
@@ -1748,7 +1749,9 @@ def prepare_source(
 
 # =========================================================
 # 第一优先级：
-# 所有新帖子
+# 所有真正新帖
+#
+# 新帖不占历史450篇额度
 # =========================================================
 
 def process_new_posts(context):
@@ -1897,9 +1900,9 @@ def parse_cached_datetime(value):
 
 
 # =========================================================
-# 历史补抓优先级
+# 历史帖子优先级
 #
-# 越新的帖子越优先
+# 越新的越优先
 # =========================================================
 
 def history_priority(
@@ -1908,7 +1911,7 @@ def history_priority(
     position
 ):
 
-    # 如果已经有真实时间
+    # 已经知道真实时间
     published = (
         parse_cached_datetime(
             item.get(
@@ -1926,7 +1929,7 @@ def history_priority(
             -position,
         )
 
-    # 从 URL 中读取 YYMM
+    # 从 URL 推断年月
     match = re.search(
         r"htm_data/"
         r"(\d{2})(\d{2})/",
@@ -1971,7 +1974,7 @@ def history_priority(
 
             rough_timestamp = 0
 
-    # URL 最后的帖子 ID
+    # 同月份再参考帖子 ID
     post_id = 0
 
     id_match = re.search(
@@ -2002,20 +2005,40 @@ def history_priority(
 # =========================================================
 # 全局历史补抓
 #
-# 三个分类共享 450 篇额度
+# 新规则：
 #
-# 自动动态分配
+# 总额度：450篇
 #
-# 越新的历史帖子越优先
+# 第一步：
+# 每个还有历史内容的分类
+# 先保证最多100篇
+#
+# 第二步：
+# 剩余名额
+# 三个分类再次按最新帖子统一竞争
+#
+# 例如：
+#
+# 亚洲：100保底
+# 欧美：100保底
+# 国产：100保底
+#
+# 剩余150：
+# 再按三个分类谁更新来决定
 # =========================================================
 
 def process_global_history_backfill(
     contexts
 ):
 
-    candidates = []
+    candidates_by_source = {}
 
-    # 收集三个分类全部待补历史
+    total_candidates = 0
+
+    # =====================================================
+    # 收集每个分类自己的历史待补帖子
+    # =====================================================
+
     for context in contexts:
 
         source = context[
@@ -2029,6 +2052,14 @@ def process_global_history_backfill(
         cache = context[
             "cache"
         ]
+
+        source_id = source[
+            "id"
+        ]
+
+        candidates_by_source[
+            source_id
+        ] = []
 
         for position, post in enumerate(
             posts
@@ -2051,7 +2082,7 @@ def process_global_history_backfill(
 
                 continue
 
-            candidates.append({
+            candidate = {
                 "source": source,
                 "context": context,
                 "post": post,
@@ -2063,19 +2094,145 @@ def process_global_history_backfill(
                         position
                     )
                 ),
-            })
+            }
 
-    # 最新 -> 最旧
-    candidates.sort(
-        key=lambda item: (
-            item["priority"]
-        ),
-        reverse=True
+            candidates_by_source[
+                source_id
+            ].append(
+                candidate
+            )
+
+            total_candidates += 1
+
+    # =====================================================
+    # 每个分类内部先按新 -> 旧排序
+    # =====================================================
+
+    for source_id in (
+        candidates_by_source
+    ):
+
+        candidates_by_source[
+            source_id
+        ].sort(
+            key=lambda item: (
+                item["priority"]
+            ),
+            reverse=True
+        )
+
+    # =====================================================
+    # 第一阶段：
+    # 每个分类先拿最多100篇保底
+    # =====================================================
+
+    tasks = []
+
+    remaining_pool = []
+
+    guaranteed_allocation = {}
+
+    for context in contexts:
+
+        source = context[
+            "source"
+        ]
+
+        source_id = source[
+            "id"
+        ]
+
+        name = source[
+            "name"
+        ]
+
+        source_candidates = (
+            candidates_by_source.get(
+                source_id,
+                []
+            )
+        )
+
+        # 该分类保底数量
+        guaranteed_count = min(
+            HISTORY_MIN_PER_SOURCE,
+            len(source_candidates)
+        )
+
+        guaranteed_tasks = (
+            source_candidates[
+                :guaranteed_count
+            ]
+        )
+
+        tasks.extend(
+            guaranteed_tasks
+        )
+
+        guaranteed_allocation[
+            name
+        ] = guaranteed_count
+
+        # 剩余项目进入全局竞争池
+        remaining_pool.extend(
+            source_candidates[
+                guaranteed_count:
+            ]
+        )
+
+    # =====================================================
+    # 如果保底还没用完450
+    # 剩余额度按全局最新排序
+    # =====================================================
+
+    remaining_slots = (
+        GLOBAL_BACKFILL_BATCH_SIZE
+        - len(tasks)
     )
 
-    tasks = candidates[
+    if remaining_slots > 0:
+
+        remaining_pool.sort(
+            key=lambda item: (
+                item["priority"]
+            ),
+            reverse=True
+        )
+
+        tasks.extend(
+            remaining_pool[
+                :remaining_slots
+            ]
+        )
+
+    # 安全限制
+    tasks = tasks[
         :GLOBAL_BACKFILL_BATCH_SIZE
     ]
+
+    # =====================================================
+    # 统计最终实际分配
+    # =====================================================
+
+    final_allocation = {}
+
+    for task in tasks:
+
+        name = task[
+            "source"
+        ]["name"]
+
+        final_allocation[name] = (
+            final_allocation.get(
+                name,
+                0
+            )
+            + 1
+        )
+
+    # =====================================================
+    # 输出调度信息
+    # =====================================================
 
     print()
     print(
@@ -2084,31 +2241,19 @@ def process_global_history_backfill(
 
     print(
         f"三个分类历史待补总数："
-        f"{len(candidates)} 篇"
+        f"{total_candidates} 篇"
     )
 
     print(
-        f"本轮全局历史补抓："
-        f"{len(tasks)} / "
+        f"本轮历史补抓上限："
         f"{GLOBAL_BACKFILL_BATCH_SIZE} 篇"
     )
 
-    # 显示动态分配
-    allocation = {}
+    print()
 
-    for task in tasks:
-
-        name = task[
-            "source"
-        ]["name"]
-
-        allocation[name] = (
-            allocation.get(
-                name,
-                0
-            )
-            + 1
-        )
+    print(
+        "保底分配："
+    )
 
     for context in contexts:
 
@@ -2117,13 +2262,41 @@ def process_global_history_backfill(
         ]["name"]
 
         print(
-            f"{name}："
-            f"{allocation.get(name, 0)} 篇"
+            f"  {name}："
+            f"{guaranteed_allocation.get(name, 0)} 篇"
         )
+
+    print()
+
+    print(
+        "加入剩余动态额度后的最终分配："
+    )
+
+    for context in contexts:
+
+        name = context[
+            "source"
+        ]["name"]
+
+        print(
+            f"  {name}："
+            f"{final_allocation.get(name, 0)} 篇"
+        )
+
+    print()
+
+    print(
+        f"本轮计划补抓总数："
+        f"{len(tasks)} 篇"
+    )
 
     print(
         "=" * 70
     )
+
+    # =====================================================
+    # 开始抓取
+    # =====================================================
 
     consecutive_403 = 0
 
@@ -2196,6 +2369,7 @@ def process_global_history_backfill(
 
             consecutive_403 = 0
 
+        # 每个分类处理20篇保存一次
         if (
             source_counts[name]
             % 20
@@ -2207,6 +2381,7 @@ def process_global_history_backfill(
                 cache
             )
 
+        # 连续403则停止本轮历史抓取
         if (
             consecutive_403
             >= MAX_CONSECUTIVE_403
@@ -2218,7 +2393,7 @@ def process_global_history_backfill(
             )
 
             print(
-                "本轮全局历史补抓提前停止，"
+                "本轮历史补抓提前停止，"
                 "剩余内容下次继续。"
             )
 
@@ -2228,7 +2403,10 @@ def process_global_history_backfill(
             index
         )
 
-    # 最后保存三个分类
+    # =====================================================
+    # 最后保存所有分类
+    # =====================================================
+
     for context in contexts:
 
         save_cache(
@@ -2313,7 +2491,7 @@ def generate_rss(context):
         f"{source['name']}："
         f"{TARGET_AUTHOR} 的帖子 RSS。"
         "新帖优先抓取全文，"
-        "历史帖子按最新优先动态补抓。"
+        "历史帖子按分类保底并结合最新优先补抓。"
     )
 
     fg.language(
@@ -2471,7 +2649,7 @@ def main():
         "开始更新多分类 RSS"
     )
 
-    # 自动创建三个分类目录
+    # 创建三个分类目录
     for source in SOURCES:
 
         ensure_source_dir(
@@ -2482,7 +2660,7 @@ def main():
 
     # =====================================================
     # 第一阶段：
-    # 先扫描三个分类全部页面
+    # 扫描三个分类全部列表
     # =====================================================
 
     for source in SOURCES:
@@ -2537,7 +2715,9 @@ def main():
 
     # =====================================================
     # 第二阶段：
-    # 三个分类所有新帖优先
+    # 三个分类真正的新帖优先
+    #
+    # 不占历史450额度
     # =====================================================
 
     site_limited = False
@@ -2559,9 +2739,11 @@ def main():
     # =====================================================
     # 第三阶段：
     #
-    # 三个分类共享 450 篇历史补抓额度
-    # 自动动态分配
-    # 最新优先
+    # 历史总额度450
+    #
+    # 每区先保底100
+    #
+    # 剩余再按全局最新动态分配
     # =====================================================
 
     if not site_limited:
