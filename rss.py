@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 
 from datetime import datetime, timezone, timedelta
 from urllib.parse import (
@@ -52,11 +53,10 @@ TARGET_AUTHOR = "愛在黑夜"
 
 DATA_DIR = "data"
 
-# 每轮历史正文总共最多抓 450 篇
+# 每轮历史正文总共最多补抓 450 篇
 GLOBAL_BACKFILL_BATCH_SIZE = 450
 
-# 每个还有历史待补内容的分类
-# 先保证最多 100 篇
+# 每个仍有历史内容的分类先保底最多 100 篇
 HISTORY_MIN_PER_SOURCE = 100
 
 SITE_TZ = timezone(
@@ -73,7 +73,7 @@ MAX_LIST_RETRIES = 5
 MAX_DETAIL_FAILURES = 3
 MAX_CONSECUTIVE_403 = 3
 
-# None = RSS 保存全部帖子
+# None = RSS 输出 cache 中全部帖子
 RSS_MAX_ITEMS = None
 
 
@@ -112,16 +112,11 @@ def get_soup(url, retries=3):
 
     last_error = None
 
-    for attempt in range(
-        1,
-        retries + 1
-    ):
+    for attempt in range(1, retries + 1):
 
         try:
 
-            print(
-                f"请求：{url}"
-            )
+            print(f"请求：{url}")
 
             response = session.get(
                 url,
@@ -129,19 +124,14 @@ def get_soup(url, retries=3):
             )
 
             if response.status_code == 403:
-
-                raise ForbiddenError(
-                    url
-                )
+                raise ForbiddenError(url)
 
             response.raise_for_status()
 
             if (
                 not response.encoding
-                or response.encoding.lower()
-                == "iso-8859-1"
+                or response.encoding.lower() == "iso-8859-1"
             ):
-
                 response.encoding = (
                     response.apparent_encoding
                     or "utf-8"
@@ -161,8 +151,7 @@ def get_soup(url, retries=3):
 
             print(
                 f"请求失败 "
-                f"{attempt}/{retries}："
-                f"{e}"
+                f"{attempt}/{retries}：{e}"
             )
 
             time.sleep(
@@ -221,9 +210,7 @@ def source_paths(source):
 
 def ensure_source_dir(source):
 
-    paths = source_paths(
-        source
-    )
+    paths = source_paths(source)
 
     os.makedirs(
         paths["dir"],
@@ -237,15 +224,9 @@ def ensure_source_dir(source):
 # JSON
 # =========================================================
 
-def load_json(
-    path,
-    default
-):
+def load_json(path, default):
 
-    if not os.path.exists(
-        path
-    ):
-
+    if not os.path.exists(path):
         return default
 
     try:
@@ -255,10 +236,7 @@ def load_json(
             "r",
             encoding="utf-8"
         ) as f:
-
-            return json.load(
-                f
-            )
+            return json.load(f)
 
     except Exception as e:
 
@@ -269,14 +247,9 @@ def load_json(
         return default
 
 
-def atomic_save_json(
-    path,
-    data
-):
+def atomic_save_json(path, data):
 
-    directory = os.path.dirname(
-        path
-    )
+    directory = os.path.dirname(path)
 
     if directory:
 
@@ -285,9 +258,7 @@ def atomic_save_json(
             exist_ok=True
         )
 
-    temp_path = (
-        path + ".tmp"
-    )
+    temp_path = path + ".tmp"
 
     with open(
         temp_path,
@@ -309,7 +280,7 @@ def atomic_save_json(
 
 
 # =========================================================
-# 缓存兼容
+# Cache 状态
 # =========================================================
 
 VALID_STATUSES = {
@@ -325,21 +296,12 @@ VALID_STATUSES = {
 
 def normalize_cache(cache):
 
-    if not isinstance(
-        cache,
-        dict
-    ):
-
+    if not isinstance(cache, dict):
         return {}
 
-    for url, item in list(
-        cache.items()
-    ):
+    for url, item in list(cache.items()):
 
-        if not isinstance(
-            item,
-            dict
-        ):
+        if not isinstance(item, dict):
 
             cache[url] = {
                 "title": "",
@@ -377,36 +339,24 @@ def normalize_cache(cache):
             0
         )
 
-        status = item.get(
-            "status"
-        )
+        status = item.get("status")
 
         if status == "retry":
 
-            item["status"] = (
-                "retry_history"
-            )
+            item["status"] = "retry_history"
 
             continue
 
         if status in VALID_STATUSES:
+            continue
+
+        if item.get("blocked"):
+
+            item["status"] = "blocked"
 
             continue
 
-        if item.get(
-            "blocked"
-        ):
-
-            item["status"] = (
-                "blocked"
-            )
-
-            continue
-
-        if (
-            item.get("ok")
-            is True
-        ):
+        if item.get("ok") is True:
 
             content = item.get(
                 "content",
@@ -418,33 +368,20 @@ def normalize_cache(cache):
                 or "等待抓取" in content
                 or not content
             ):
-
-                item["status"] = (
-                    "index_only"
-                )
+                item["status"] = "index_only"
 
             else:
-
-                item["status"] = (
-                    "full"
-                )
+                item["status"] = "full"
 
             continue
 
-        if (
-            item.get("ok")
-            is False
-        ):
+        if item.get("ok") is False:
 
-            item["status"] = (
-                "retry_history"
-            )
+            item["status"] = "retry_history"
 
             continue
 
-        item["status"] = (
-            "index_only"
-        )
+        item["status"] = "index_only"
 
     return cache
 
@@ -464,17 +401,13 @@ def load_cache(source):
 
     print(
         f"[{source['name']}] "
-        f"读取缓存："
-        f"{len(cache)} 篇"
+        f"读取缓存：{len(cache)} 篇"
     )
 
     return cache
 
 
-def save_cache(
-    source,
-    cache
-):
+def save_cache(source, cache):
 
     paths = ensure_source_dir(
         source
@@ -487,13 +420,12 @@ def save_cache(
 
     print(
         f"[{source['name']}] "
-        f"缓存已保存："
-        f"{len(cache)} 篇"
+        f"缓存已保存：{len(cache)} 篇"
     )
 
 
 # =========================================================
-# 状态
+# State
 # =========================================================
 
 def load_state(source):
@@ -509,10 +441,7 @@ def load_state(source):
         }
     )
 
-    if not isinstance(
-        state,
-        dict
-    ):
+    if not isinstance(state, dict):
 
         state = {
             "initialized": False
@@ -526,10 +455,7 @@ def load_state(source):
     return state
 
 
-def save_state(
-    source,
-    state
-):
+def save_state(source, state):
 
     paths = ensure_source_dir(
         source
@@ -545,10 +471,7 @@ def save_state(
 # 分页 URL
 # =========================================================
 
-def make_page_url(
-    source,
-    page
-):
+def make_page_url(source, page):
 
     parsed = urlparse(
         source["url"]
@@ -570,9 +493,7 @@ def make_page_url(
 
     else:
 
-        query["page"] = str(
-            page
-        )
+        query["page"] = str(page)
 
     return urlunparse(
         (
@@ -586,14 +507,7 @@ def make_page_url(
     )
 
 
-# =========================================================
-# 判断分页是否属于当前分类
-# =========================================================
-
-def same_source_query(
-    source,
-    href
-):
+def same_source_query(source, href):
 
     source_parsed = urlparse(
         source["url"]
@@ -616,11 +530,7 @@ def same_source_query(
         parsed.query
     )
 
-    if (
-        parsed.path
-        != source_parsed.path
-    ):
-
+    if parsed.path != source_parsed.path:
         return False
 
     for key in (
@@ -642,14 +552,13 @@ def same_source_query(
             expected is not None
             and actual != expected
         ):
-
             return False
 
     return True
 
 
 # =========================================================
-# 自动检测总页数
+# 检测总页数
 # =========================================================
 
 def get_total_pages(source):
@@ -680,7 +589,6 @@ def get_total_pages(source):
                     source,
                     href
                 ):
-
                     continue
 
                 full_url = urljoin(
@@ -695,7 +603,6 @@ def get_total_pages(source):
                 )
 
                 if "page" not in query:
-
                     continue
 
                 page = int(
@@ -703,13 +610,9 @@ def get_total_pages(source):
                 )
 
                 if page >= 1:
-
-                    pages.add(
-                        page
-                    )
+                    pages.add(page)
 
             except Exception:
-
                 continue
 
     except Exception as e:
@@ -719,9 +622,7 @@ def get_total_pages(source):
             f"自动检测页数失败：{e}"
         )
 
-    detected = max(
-        pages
-    )
+    detected = max(pages)
 
     total = max(
         detected,
@@ -743,13 +644,10 @@ def get_total_pages(source):
 
 
 # =========================================================
-# 单个列表页
+# 列表页帖子
 # =========================================================
 
-def get_posts_from_page(
-    source,
-    page
-):
+def get_posts_from_page(source, page):
 
     soup = get_soup(
         make_page_url(
@@ -773,7 +671,6 @@ def get_posts_from_page(
         )
 
         if "htm_data" not in href:
-
             continue
 
         title = a.get_text(
@@ -782,7 +679,6 @@ def get_posts_from_page(
         )
 
         if not title:
-
             continue
 
         url = urljoin(
@@ -791,12 +687,9 @@ def get_posts_from_page(
         )
 
         if url in seen:
-
             continue
 
-        seen.add(
-            url
-        )
+        seen.add(url)
 
         posts.append({
             "title": title,
@@ -805,10 +698,6 @@ def get_posts_from_page(
 
     return posts
 
-
-# =========================================================
-# 列表页请求
-# =========================================================
 
 def fetch_list_page(
     source,
@@ -824,16 +713,13 @@ def fetch_list_page(
 
         try:
 
-            posts = (
-                get_posts_from_page(
-                    source,
-                    page
-                )
+            posts = get_posts_from_page(
+                source,
+                page
             )
 
             if not posts:
 
-                # 最后一页允许为空
                 if allow_empty:
 
                     print(
@@ -843,10 +729,7 @@ def fetch_list_page(
                         "视为正常空尾页。"
                     )
 
-                    return (
-                        [],
-                        ()
-                    )
+                    return [], ()
 
                 print(
                     f"[{source['name']}] "
@@ -868,8 +751,7 @@ def fetch_list_page(
 
             if (
                 previous_signature
-                and signature
-                == previous_signature
+                and signature == previous_signature
             ):
 
                 print(
@@ -885,22 +767,16 @@ def fetch_list_page(
 
                 continue
 
-            return (
-                posts,
-                signature
-            )
+            return posts, signature
 
         except ForbiddenError:
 
             print(
                 f"[{source['name']}] "
-                f"第 {page} 个列表页返回 403"
+                f"第 {page} 页返回 403"
             )
 
-            return (
-                None,
-                None
-            )
+            return None, None
 
         except Exception as e:
 
@@ -908,30 +784,24 @@ def fetch_list_page(
                 f"[{source['name']}] "
                 f"第 {page} 页失败 "
                 f"{attempt}/"
-                f"{MAX_LIST_RETRIES}："
-                f"{e}"
+                f"{MAX_LIST_RETRIES}：{e}"
             )
 
             time.sleep(
                 attempt * 5
             )
 
-    return (
-        None,
-        None
-    )
+    return None, None
 
 
 # =========================================================
-# 扫描某分类全部分页
+# 扫描所有列表页
 # =========================================================
 
 def collect_all_list_posts(source):
 
-    total_pages = (
-        get_total_pages(
-            source
-        )
+    total_pages = get_total_pages(
+        source
     )
 
     all_posts = []
@@ -953,18 +823,16 @@ def collect_all_list_posts(source):
             f"{page}/{total_pages} 页"
         )
 
-        posts, signature = (
-            fetch_list_page(
-                source,
-                page,
-                previous_signature,
-                allow_empty=(
-                    page == total_pages
-                ),
-            )
+        posts, signature = fetch_list_page(
+            source,
+            page,
+            previous_signature,
+            allow_empty=(
+                page == total_pages
+            ),
         )
 
-        # None = 真失败
+        # 真失败
         if posts is None:
 
             failed_pages.append(
@@ -979,7 +847,7 @@ def collect_all_list_posts(source):
 
             continue
 
-        # [] = 合法空尾页
+        # 合法空尾页
         if len(posts) == 0:
 
             print(
@@ -990,19 +858,13 @@ def collect_all_list_posts(source):
 
             continue
 
-        previous_signature = (
-            signature
-        )
+        previous_signature = signature
 
         added = 0
 
         for post in posts:
 
-            if (
-                post["url"]
-                in seen_urls
-            ):
-
+            if post["url"] in seen_urls:
                 continue
 
             seen_urls.add(
@@ -1044,15 +906,13 @@ def collect_all_list_posts(source):
 
         for page in failed_pages:
 
-            posts, _ = (
-                fetch_list_page(
-                    source,
-                    page,
-                    None,
-                    allow_empty=(
-                        page == total_pages
-                    ),
-                )
+            posts, _ = fetch_list_page(
+                source,
+                page,
+                None,
+                allow_empty=(
+                    page == total_pages
+                ),
             )
 
             if posts is None:
@@ -1075,10 +935,7 @@ def collect_all_list_posts(source):
 
             for post in posts:
 
-                if (
-                    post["url"]
-                    not in seen_urls
-                ):
+                if post["url"] not in seen_urls:
 
                     seen_urls.add(
                         post["url"]
@@ -1103,18 +960,14 @@ def collect_all_list_posts(source):
     print(
         f"[{source['name']}] "
         f"扫描完成，共 "
-        f"{len(all_posts)} 个"
-        "不重复帖子"
+        f"{len(all_posts)} 个不重复帖子"
     )
 
-    return (
-        all_posts,
-        total_pages
-    )
+    return all_posts, total_pages
 
 
 # =========================================================
-# 从 URL 推断年份
+# 时间
 # =========================================================
 
 def infer_year_from_url(
@@ -1139,27 +992,17 @@ def infer_year_from_url(
         )
 
         if 1 <= mm <= 12:
-
-            return (
-                2000 + yy
-            )
+            return 2000 + yy
 
     now = datetime.now(
         SITE_TZ
     )
 
     if fallback_month > now.month:
-
-        return (
-            now.year - 1
-        )
+        return now.year - 1
 
     return now.year
 
-
-# =========================================================
-# 真实发布时间
-# =========================================================
 
 def parse_publish_time(
     soup,
@@ -1195,11 +1038,9 @@ def parse_publish_time(
         )
 
         if match:
-
             break
 
     if not match:
-
         return None
 
     month, day, hour, minute = map(
@@ -1224,7 +1065,29 @@ def parse_publish_time(
         )
 
     except ValueError:
+        return None
 
+
+def parse_cached_datetime(value):
+
+    if not value:
+        return None
+
+    try:
+
+        dt = datetime.fromisoformat(
+            value
+        )
+
+        if dt.tzinfo is None:
+
+            dt = dt.replace(
+                tzinfo=SITE_TZ
+            )
+
+        return dt
+
+    except Exception:
         return None
 
 
@@ -1238,7 +1101,6 @@ def clean_content(
 ):
 
     if node is None:
-
         return ""
 
     for bad in node.find_all(
@@ -1249,16 +1111,11 @@ def clean_content(
             "noscript",
         ]
     ):
-
         bad.decompose()
 
-    for img in node.find_all(
-        "img"
-    ):
+    for img in node.find_all("img"):
 
-        src = img.get(
-            "src"
-        )
+        src = img.get("src")
 
         if src:
 
@@ -1332,7 +1189,7 @@ def find_main_content(
 
 
 # =========================================================
-# 单篇详情
+# 详情页
 # =========================================================
 
 def fetch_post_detail(post):
@@ -1343,18 +1200,14 @@ def fetch_post_detail(post):
             post["url"]
         )
 
-        published = (
-            parse_publish_time(
-                soup,
-                post["url"]
-            )
+        published = parse_publish_time(
+            soup,
+            post["url"]
         )
 
-        content = (
-            find_main_content(
-                soup,
-                post["url"]
-            )
+        content = find_main_content(
+            soup,
+            post["url"]
         )
 
         if not content:
@@ -1368,13 +1221,11 @@ def fetch_post_detail(post):
 
         return {
             "type": "success",
-
             "published": (
                 published.isoformat()
                 if published
                 else None
             ),
-
             "content": content,
         }
 
@@ -1406,7 +1257,7 @@ def fetch_post_detail(post):
 
 
 # =========================================================
-# 历史索引
+# Cache 项目
 # =========================================================
 
 def make_index_item(post):
@@ -1414,7 +1265,6 @@ def make_index_item(post):
     return {
         "title": post["title"],
         "url": post["url"],
-
         "published": None,
 
         "content": (
@@ -1424,13 +1274,23 @@ def make_index_item(post):
         ),
 
         "status": "index_only",
-
         "fail_count": 0,
     }
 
 
 # =========================================================
-# 列表同步进缓存
+# 同步列表到 Cache
+#
+# 重要：
+#
+# 每次扫描之后，
+# Cache 顺序重新按照网站扫描顺序排列。
+#
+# 新帖出现在第一页，
+# 就会自动排到 Cache 前面。
+#
+# 不再出现：
+# 新帖因为后加入 Cache 而跑到底部。
 # =========================================================
 
 def sync_list_to_cache(
@@ -1441,26 +1301,35 @@ def sync_list_to_cache(
 
     new_count = 0
 
+    reordered_cache = {}
+
+    scanned_urls = set()
+
+    # =====================================================
+    # 首先完全按照本轮扫描顺序建立 Cache
+    # =====================================================
+
     for post in list_posts:
 
         url = post["url"]
 
+        scanned_urls.add(url)
+
         if url in cache:
 
-            cache[url][
-                "title"
-            ] = post["title"]
+            item = cache[url]
 
-            cache[url][
-                "url"
-            ] = url
+            item["title"] = post["title"]
+            item["url"] = url
+
+            reordered_cache[url] = item
 
             continue
 
-        # 第一次初始化
+        # 第一次建立数据
         if baseline_mode:
 
-            cache[url] = (
+            reordered_cache[url] = (
                 make_index_item(
                     post
                 )
@@ -1468,11 +1337,10 @@ def sync_list_to_cache(
 
             continue
 
-        # 真正的新帖子
-        cache[url] = {
+        # 真正新增
+        reordered_cache[url] = {
             "title": post["title"],
             "url": url,
-
             "published": None,
 
             "content": (
@@ -1482,17 +1350,41 @@ def sync_list_to_cache(
             ),
 
             "status": "pending_new",
-
             "fail_count": 0,
         }
 
         new_count += 1
 
+    # =====================================================
+    # 如果旧 Cache 中有帖子本轮列表暂时没扫到，
+    # 不直接删除。
+    #
+    # 放在 Cache 最后。
+    # =====================================================
+
+    for url, item in cache.items():
+
+        if url in scanned_urls:
+            continue
+
+        reordered_cache[url] = item
+
+    # =====================================================
+    # 原地替换
+    # 保证调用方仍然使用同一个 dict 对象
+    # =====================================================
+
+    cache.clear()
+
+    cache.update(
+        reordered_cache
+    )
+
     return new_count
 
 
 # =========================================================
-# 写入详情结果
+# 详情结果
 # =========================================================
 
 def apply_detail_result(
@@ -1509,24 +1401,17 @@ def apply_detail_result(
         {}
     )
 
-    old_published = (
-        old_item.get(
-            "published"
-        )
+    old_published = old_item.get(
+        "published"
     )
 
-    old_content = (
-        old_item.get(
-            "content",
-            ""
-        )
+    old_content = old_item.get(
+        "content",
+        ""
     )
 
     # 成功
-    if (
-        result["type"]
-        == "success"
-    ):
+    if result["type"] == "success":
 
         cache[url] = {
             "title": post["title"],
@@ -1547,25 +1432,19 @@ def apply_detail_result(
             ),
 
             "status": "full",
-
             "fail_count": 0,
         }
 
         return "success"
 
     # 403
-    if (
-        result["type"]
-        == "403"
-    ):
+    if result["type"] == "403":
 
         cache[url] = {
             "title": post["title"],
             "url": url,
 
-            "published": (
-                old_published
-            ),
+            "published": old_published,
 
             "content": (
                 "<p>"
@@ -1576,11 +1455,9 @@ def apply_detail_result(
 
             "status": "blocked",
 
-            "fail_count": (
-                old_item.get(
-                    "fail_count",
-                    0
-                )
+            "fail_count": old_item.get(
+                "fail_count",
+                0
             ),
         }
 
@@ -1595,11 +1472,7 @@ def apply_detail_result(
         + 1
     )
 
-    if (
-        fail_count
-        >= MAX_DETAIL_FAILURES
-    ):
-
+    if fail_count >= MAX_DETAIL_FAILURES:
         status = "failed"
 
     else:
@@ -1613,10 +1486,7 @@ def apply_detail_result(
     cache[url] = {
         "title": post["title"],
         "url": url,
-
-        "published": (
-            old_published
-        ),
+        "published": old_published,
 
         "content": (
             old_content
@@ -1627,10 +1497,7 @@ def apply_detail_result(
         ),
 
         "status": status,
-
-        "fail_count": (
-            fail_count
-        ),
+        "fail_count": fail_count,
     }
 
     return "error"
@@ -1648,9 +1515,7 @@ def detail_pause(index):
 
     if (
         index > 0
-        and index
-        % DETAIL_PAUSE_EVERY
-        == 0
+        and index % DETAIL_PAUSE_EVERY == 0
     ):
 
         print(
@@ -1665,7 +1530,7 @@ def detail_pause(index):
 
 
 # =========================================================
-# 初始化分类
+# 准备分类
 # =========================================================
 
 def prepare_source(
@@ -1689,19 +1554,15 @@ def prepare_source(
         )
     )
 
-    # 第一次运行：
-    # 当前已有内容全部作为历史
     baseline_mode = (
         not initialized
         or not cache
     )
 
-    new_count = (
-        sync_list_to_cache(
-            list_posts,
-            cache,
-            baseline_mode
-        )
+    new_count = sync_list_to_cache(
+        list_posts,
+        cache,
+        baseline_mode
     )
 
     state.update({
@@ -1713,12 +1574,10 @@ def prepare_source(
             ).isoformat()
         ),
 
-        "last_total_pages": (
-            total_pages
-        ),
+        "last_total_pages": total_pages,
 
-        "last_list_count": (
-            len(list_posts)
+        "last_list_count": len(
+            list_posts
         ),
     })
 
@@ -1748,25 +1607,14 @@ def prepare_source(
 
 
 # =========================================================
-# 第一优先级：
-# 所有真正新帖
-#
-# 新帖不占历史450篇额度
+# 新帖优先
 # =========================================================
 
 def process_new_posts(context):
 
-    source = context[
-        "source"
-    ]
-
-    posts = context[
-        "list_posts"
-    ]
-
-    cache = context[
-        "cache"
-    ]
+    source = context["source"]
+    posts = context["list_posts"]
+    cache = context["cache"]
 
     tasks = [
         post
@@ -1774,9 +1622,7 @@ def process_new_posts(context):
         if cache.get(
             post["url"],
             {}
-        ).get(
-            "status"
-        )
+        ).get("status")
         in {
             "pending_new",
             "retry_new",
@@ -1791,9 +1637,7 @@ def process_new_posts(context):
 
     consecutive_403 = 0
 
-    total = len(
-        tasks
-    )
+    total = len(tasks)
 
     for index, post in enumerate(
         tasks,
@@ -1802,38 +1646,27 @@ def process_new_posts(context):
 
         print(
             f"[{source['name']}] "
-            f"[新帖 "
-            f"{index}/{total}] "
+            f"[新帖 {index}/{total}] "
             f"{post['title']}"
         )
 
-        result = (
-            fetch_post_detail(
-                post
-            )
+        result = fetch_post_detail(
+            post
         )
 
-        outcome = (
-            apply_detail_result(
-                post,
-                result,
-                cache,
-                True
-            )
+        outcome = apply_detail_result(
+            post,
+            result,
+            cache,
+            True
         )
 
         if outcome == "403":
-
             consecutive_403 += 1
-
         else:
-
             consecutive_403 = 0
 
-        if (
-            index % 10
-            == 0
-        ):
+        if index % 10 == 0:
 
             save_cache(
                 source,
@@ -1858,9 +1691,7 @@ def process_new_posts(context):
 
             return True
 
-        detail_pause(
-            index
-        )
+        detail_pause(index)
 
     save_cache(
         source,
@@ -1871,38 +1702,7 @@ def process_new_posts(context):
 
 
 # =========================================================
-# RSS 时间解析
-# =========================================================
-
-def parse_cached_datetime(value):
-
-    if not value:
-
-        return None
-
-    try:
-
-        dt = datetime.fromisoformat(
-            value
-        )
-
-        if dt.tzinfo is None:
-
-            dt = dt.replace(
-                tzinfo=SITE_TZ
-            )
-
-        return dt
-
-    except Exception:
-
-        return None
-
-
-# =========================================================
-# 历史帖子优先级
-#
-# 越新的越优先
+# 历史优先级
 # =========================================================
 
 def history_priority(
@@ -1911,12 +1711,9 @@ def history_priority(
     position
 ):
 
-    # 已经知道真实时间
-    published = (
-        parse_cached_datetime(
-            item.get(
-                "published"
-            )
+    published = parse_cached_datetime(
+        item.get(
+            "published"
         )
     )
 
@@ -1929,7 +1726,6 @@ def history_priority(
             -position,
         )
 
-    # 从 URL 推断年月
     match = re.search(
         r"htm_data/"
         r"(\d{2})(\d{2})/",
@@ -1961,20 +1757,16 @@ def history_priority(
 
         try:
 
-            rough_timestamp = (
-                datetime(
-                    year,
-                    month,
-                    1,
-                    tzinfo=SITE_TZ
-                ).timestamp()
-            )
+            rough_timestamp = datetime(
+                year,
+                month,
+                1,
+                tzinfo=SITE_TZ
+            ).timestamp()
 
         except Exception:
-
             rough_timestamp = 0
 
-    # 同月份再参考帖子 ID
     post_id = 0
 
     id_match = re.search(
@@ -1991,7 +1783,6 @@ def history_priority(
             )
 
         except Exception:
-
             post_id = 0
 
     return (
@@ -2003,28 +1794,14 @@ def history_priority(
 
 
 # =========================================================
-# 全局历史补抓
+# 历史补抓
 #
-# 新规则：
+# 总额度 450
 #
-# 总额度：450篇
+# 每区先保底最多 100
 #
-# 第一步：
-# 每个还有历史内容的分类
-# 先保证最多100篇
-#
-# 第二步：
-# 剩余名额
-# 三个分类再次按最新帖子统一竞争
-#
-# 例如：
-#
-# 亚洲：100保底
-# 欧美：100保底
-# 国产：100保底
-#
-# 剩余150：
-# 再按三个分类谁更新来决定
+# 剩余额度再按照三个分类中
+# 最新历史帖子动态分配
 # =========================================================
 
 def process_global_history_backfill(
@@ -2035,27 +1812,13 @@ def process_global_history_backfill(
 
     total_candidates = 0
 
-    # =====================================================
-    # 收集每个分类自己的历史待补帖子
-    # =====================================================
-
     for context in contexts:
 
-        source = context[
-            "source"
-        ]
+        source = context["source"]
+        posts = context["list_posts"]
+        cache = context["cache"]
 
-        posts = context[
-            "list_posts"
-        ]
-
-        cache = context[
-            "cache"
-        ]
-
-        source_id = source[
-            "id"
-        ]
+        source_id = source["id"]
 
         candidates_by_source[
             source_id
@@ -2079,7 +1842,6 @@ def process_global_history_backfill(
                 "index_only",
                 "retry_history",
             }:
-
                 continue
 
             candidate = {
@@ -2087,12 +1849,10 @@ def process_global_history_backfill(
                 "context": context,
                 "post": post,
 
-                "priority": (
-                    history_priority(
-                        post,
-                        item,
-                        position
-                    )
+                "priority": history_priority(
+                    post,
+                    item,
+                    position
                 ),
             }
 
@@ -2104,27 +1864,15 @@ def process_global_history_backfill(
 
             total_candidates += 1
 
-    # =====================================================
-    # 每个分类内部先按新 -> 旧排序
-    # =====================================================
-
-    for source_id in (
-        candidates_by_source
-    ):
+    # 每区内部先最新 -> 最旧
+    for source_id in candidates_by_source:
 
         candidates_by_source[
             source_id
         ].sort(
-            key=lambda item: (
-                item["priority"]
-            ),
+            key=lambda item: item["priority"],
             reverse=True
         )
-
-    # =====================================================
-    # 第一阶段：
-    # 每个分类先拿最多100篇保底
-    # =====================================================
 
     tasks = []
 
@@ -2132,19 +1880,17 @@ def process_global_history_backfill(
 
     guaranteed_allocation = {}
 
+    # =====================================================
+    # 第一阶段：
+    # 每区最多100篇保底
+    # =====================================================
+
     for context in contexts:
 
-        source = context[
-            "source"
-        ]
+        source = context["source"]
 
-        source_id = source[
-            "id"
-        ]
-
-        name = source[
-            "name"
-        ]
+        source_id = source["id"]
+        name = source["name"]
 
         source_candidates = (
             candidates_by_source.get(
@@ -2153,7 +1899,6 @@ def process_global_history_backfill(
             )
         )
 
-        # 该分类保底数量
         guaranteed_count = min(
             HISTORY_MIN_PER_SOURCE,
             len(source_candidates)
@@ -2173,7 +1918,6 @@ def process_global_history_backfill(
             name
         ] = guaranteed_count
 
-        # 剩余项目进入全局竞争池
         remaining_pool.extend(
             source_candidates[
                 guaranteed_count:
@@ -2181,8 +1925,8 @@ def process_global_history_backfill(
         )
 
     # =====================================================
-    # 如果保底还没用完450
-    # 剩余额度按全局最新排序
+    # 第二阶段：
+    # 剩余名额全局最新优先
     # =====================================================
 
     remaining_slots = (
@@ -2193,9 +1937,7 @@ def process_global_history_backfill(
     if remaining_slots > 0:
 
         remaining_pool.sort(
-            key=lambda item: (
-                item["priority"]
-            ),
+            key=lambda item: item["priority"],
             reverse=True
         )
 
@@ -2205,14 +1947,9 @@ def process_global_history_backfill(
             ]
         )
 
-    # 安全限制
     tasks = tasks[
         :GLOBAL_BACKFILL_BATCH_SIZE
     ]
-
-    # =====================================================
-    # 统计最终实际分配
-    # =====================================================
 
     final_allocation = {}
 
@@ -2230,14 +1967,8 @@ def process_global_history_backfill(
             + 1
         )
 
-    # =====================================================
-    # 输出调度信息
-    # =====================================================
-
     print()
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
     print(
         f"三个分类历史待补总数："
@@ -2251,9 +1982,7 @@ def process_global_history_backfill(
 
     print()
 
-    print(
-        "保底分配："
-    )
+    print("保底分配：")
 
     for context in contexts:
 
@@ -2269,7 +1998,7 @@ def process_global_history_backfill(
     print()
 
     print(
-        "加入剩余动态额度后的最终分配："
+        "最终动态分配："
     )
 
     for context in contexts:
@@ -2290,46 +2019,25 @@ def process_global_history_backfill(
         f"{len(tasks)} 篇"
     )
 
-    print(
-        "=" * 70
-    )
-
-    # =====================================================
-    # 开始抓取
-    # =====================================================
+    print("=" * 70)
 
     consecutive_403 = 0
 
     source_counts = {}
 
-    total = len(
-        tasks
-    )
+    total = len(tasks)
 
     for index, task in enumerate(
         tasks,
         start=1
     ):
 
-        source = task[
-            "source"
-        ]
+        source = task["source"]
+        context = task["context"]
+        post = task["post"]
+        cache = context["cache"]
 
-        context = task[
-            "context"
-        ]
-
-        post = task[
-            "post"
-        ]
-
-        cache = context[
-            "cache"
-        ]
-
-        name = source[
-            "name"
-        ]
+        name = source["name"]
 
         print(
             f"[全局历史 "
@@ -2338,19 +2046,15 @@ def process_global_history_backfill(
             f"{post['title']}"
         )
 
-        result = (
-            fetch_post_detail(
-                post
-            )
+        result = fetch_post_detail(
+            post
         )
 
-        outcome = (
-            apply_detail_result(
-                post,
-                result,
-                cache,
-                False
-            )
+        outcome = apply_detail_result(
+            post,
+            result,
+            cache,
+            False
         )
 
         source_counts[name] = (
@@ -2362,14 +2066,10 @@ def process_global_history_backfill(
         )
 
         if outcome == "403":
-
             consecutive_403 += 1
-
         else:
-
             consecutive_403 = 0
 
-        # 每个分类处理20篇保存一次
         if (
             source_counts[name]
             % 20
@@ -2381,7 +2081,6 @@ def process_global_history_backfill(
                 cache
             )
 
-        # 连续403则停止本轮历史抓取
         if (
             consecutive_403
             >= MAX_CONSECUTIVE_403
@@ -2399,13 +2098,7 @@ def process_global_history_backfill(
 
             break
 
-        detail_pause(
-            index
-        )
-
-    # =====================================================
-    # 最后保存所有分类
-    # =====================================================
+        detail_pause(index)
 
     for context in contexts:
 
@@ -2422,50 +2115,37 @@ def process_global_history_backfill(
 
 # =========================================================
 # 生成 RSS
+#
+# 最重要规则：
+#
+# RSS 必须和 Cache：
+#
+# 1. 数量一致
+# 2. URL 一致
+# 3. 顺序一致
+#
+# FeedGenerator 本身会反转 add_entry 顺序，
+# 因此这里使用 reversed(items)。
 # =========================================================
 
 def generate_rss(context):
 
-    source = context[
-        "source"
-    ]
-
-    cache = context[
-        "cache"
-    ]
+    source = context["source"]
+    cache = context["cache"]
 
     paths = ensure_source_dir(
         source
     )
 
+    # 不再按照 published 重新排序。
+    #
+    # Cache 当前是什么顺序，
+    # RSS 就是什么顺序。
     items = list(
         cache.values()
     )
 
-    minimum_time = datetime(
-        1970,
-        1,
-        1,
-        tzinfo=SITE_TZ
-    )
-
-    # 按真实发布时间倒序
-    items.sort(
-        key=lambda item: (
-            parse_cached_datetime(
-                item.get(
-                    "published"
-                )
-            )
-            or minimum_time
-        ),
-        reverse=True
-    )
-
-    if (
-        RSS_MAX_ITEMS
-        is not None
-    ):
+    if RSS_MAX_ITEMS is not None:
 
         items = items[
             :RSS_MAX_ITEMS
@@ -2490,8 +2170,8 @@ def generate_rss(context):
     fg.description(
         f"{source['name']}："
         f"{TARGET_AUTHOR} 的帖子 RSS。"
-        "新帖优先抓取全文，"
-        "历史帖子按分类保底并结合最新优先补抓。"
+        "RSS 顺序与 posts_cache.json "
+        "扫描顺序完全一致。"
     )
 
     fg.language(
@@ -2504,21 +2184,23 @@ def generate_rss(context):
         )
     )
 
-    for post in items:
+    # =====================================================
+    # FeedGenerator 输出顺序与添加顺序相反，
+    # 所以这里 reversed。
+    #
+    # 最终 XML 顺序才能与 Cache 一致。
+    # =====================================================
 
-        url = post.get(
-            "url"
-        )
+    for post in reversed(items):
+
+        url = post.get("url")
 
         if not url:
-
             continue
 
         fe = fg.add_entry()
 
-        fe.id(
-            url
-        )
+        fe.id(url)
 
         fe.guid(
             url,
@@ -2526,9 +2208,7 @@ def generate_rss(context):
         )
 
         fe.title(
-            post.get(
-                "title"
-            )
+            post.get("title")
             or "无标题"
         )
 
@@ -2541,19 +2221,14 @@ def generate_rss(context):
             "name": TARGET_AUTHOR
         })
 
-        published = (
-            parse_cached_datetime(
-                post.get(
-                    "published"
-                )
+        published = parse_cached_datetime(
+            post.get(
+                "published"
             )
         )
 
         if published:
-
-            fe.pubDate(
-                published
-            )
+            fe.pubDate(published)
 
         status = post.get(
             "status",
@@ -2604,9 +2279,7 @@ def generate_rss(context):
         )
 
         content = (
-            post.get(
-                "content"
-            )
+            post.get("content")
             or
             "<p>"
             "暂时没有可显示的正文。"
@@ -2627,9 +2300,202 @@ def generate_rss(context):
             f'</p>'
         )
 
+    # =====================================================
+    # 写 RSS
+    # =====================================================
+
     fg.rss_file(
         paths["feed"],
         pretty=True
+    )
+
+    # =====================================================
+    # 写完立即验证
+    # =====================================================
+
+    tree = ET.parse(
+        paths["feed"]
+    )
+
+    root = tree.getroot()
+
+    feed_items = root.findall(
+        "./channel/item"
+    )
+
+    feed_links = []
+
+    feed_titles = []
+
+    for item in feed_items:
+
+        link = item.findtext(
+            "link"
+        )
+
+        title = item.findtext(
+            "title"
+        )
+
+        if link:
+
+            feed_links.append(
+                link.strip()
+            )
+
+            feed_titles.append(
+                title or ""
+            )
+
+    cache_links = []
+
+    cache_titles = []
+
+    for post in items:
+
+        url = post.get("url")
+
+        if not url:
+            continue
+
+        cache_links.append(url)
+
+        cache_titles.append(
+            post.get("title")
+            or "无标题"
+        )
+
+    print()
+    print(
+        f"[{source['name']}] "
+        f"Cache 条数："
+        f"{len(cache_links)}"
+    )
+
+    print(
+        f"[{source['name']}] "
+        f"Feed 条数："
+        f"{len(feed_links)}"
+    )
+
+    # =====================================================
+    # 数量检查
+    # =====================================================
+
+    if (
+        len(feed_links)
+        != len(cache_links)
+    ):
+
+        raise RuntimeError(
+            f"[{source['name']}] "
+            f"RSS 数量与 Cache 不一致："
+            f"Cache={len(cache_links)}，"
+            f"Feed={len(feed_links)}"
+        )
+
+    # =====================================================
+    # URL / 顺序检查
+    # =====================================================
+
+    if feed_links != cache_links:
+
+        mismatch_index = None
+
+        for i, (
+            cache_url,
+            feed_url
+        ) in enumerate(
+            zip(
+                cache_links,
+                feed_links
+            ),
+            start=1
+        ):
+
+            if cache_url != feed_url:
+
+                mismatch_index = i
+
+                break
+
+        raise RuntimeError(
+            f"[{source['name']}] "
+            f"RSS URL 或顺序与 Cache 不一致。"
+            f"第一个错误位置："
+            f"{mismatch_index}"
+        )
+
+    # =====================================================
+    # Title 检查
+    # =====================================================
+
+    if feed_titles != cache_titles:
+
+        mismatch_index = None
+
+        for i, (
+            cache_title,
+            feed_title
+        ) in enumerate(
+            zip(
+                cache_titles,
+                feed_titles
+            ),
+            start=1
+        ):
+
+            if cache_title != feed_title:
+
+                mismatch_index = i
+
+                break
+
+        raise RuntimeError(
+            f"[{source['name']}] "
+            f"RSS Title 与 Cache 不一致。"
+            f"第一个错误位置："
+            f"{mismatch_index}"
+        )
+
+    # =====================================================
+    # 重复检查
+    # =====================================================
+
+    if (
+        len(set(feed_links))
+        != len(feed_links)
+    ):
+
+        raise RuntimeError(
+            f"[{source['name']}] "
+            "Feed 中检测到重复 URL。"
+        )
+
+    print(
+        f"✅ [{source['name']}] "
+        f"Feed 与 Cache 完全一致："
+        f"{len(feed_links)} 篇"
+    )
+
+    print(
+        "   数量 ✅"
+    )
+
+    print(
+        "   URL ✅"
+    )
+
+    print(
+        "   Title ✅"
+    )
+
+    print(
+        "   顺序 ✅"
+    )
+
+    print(
+        "   无重复 ✅"
     )
 
     print(
@@ -2649,7 +2515,6 @@ def main():
         "开始更新多分类 RSS"
     )
 
-    # 创建三个分类目录
     for source in SOURCES:
 
         ensure_source_dir(
@@ -2659,25 +2524,20 @@ def main():
     contexts = []
 
     # =====================================================
-    # 第一阶段：
-    # 扫描三个分类全部列表
+    # 1. 扫描三个分类
     # =====================================================
 
     for source in SOURCES:
 
         print()
-        print(
-            "#" * 70
-        )
+        print("#" * 70)
 
         print(
             f"扫描分类："
             f"{source['name']}"
         )
 
-        print(
-            "#" * 70
-        )
+        print("#" * 70)
 
         try:
 
@@ -2687,12 +2547,10 @@ def main():
                 )
             )
 
-            context = (
-                prepare_source(
-                    source,
-                    posts,
-                    total_pages
-                )
+            context = prepare_source(
+                source,
+                posts,
+                total_pages
             )
 
             contexts.append(
@@ -2714,20 +2572,15 @@ def main():
         )
 
     # =====================================================
-    # 第二阶段：
-    # 三个分类真正的新帖优先
-    #
-    # 不占历史450额度
+    # 2. 真正的新帖优先
     # =====================================================
 
     site_limited = False
 
     for context in contexts:
 
-        limited = (
-            process_new_posts(
-                context
-            )
+        limited = process_new_posts(
+            context
         )
 
         if limited:
@@ -2737,13 +2590,11 @@ def main():
             break
 
     # =====================================================
-    # 第三阶段：
+    # 3. 历史补抓
     #
-    # 历史总额度450
-    #
-    # 每区先保底100
-    #
-    # 剩余再按全局最新动态分配
+    # 总450
+    # 每区保底100
+    # 剩余动态分配
     # =====================================================
 
     if not site_limited:
@@ -2760,8 +2611,7 @@ def main():
         )
 
     # =====================================================
-    # 第四阶段：
-    # 分别生成三个 RSS
+    # 4. 生成并验证三个 RSS
     # =====================================================
 
     for context in contexts:
@@ -2772,7 +2622,7 @@ def main():
 
     print()
     print(
-        "全部分类处理完成。"
+        "✅ 全部分类处理完成。"
     )
 
 
