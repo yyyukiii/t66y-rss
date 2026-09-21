@@ -1,9 +1,17 @@
 import json
 import os
 import re
+import shutil
 import time
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import (
+    urljoin,
+    urlparse,
+    parse_qs,
+    parse_qsl,
+    urlencode,
+    urlunparse,
+)
 
 import requests
 from bs4 import BeautifulSoup
@@ -11,83 +19,64 @@ from feedgen.feed import FeedGenerator
 
 
 # =========================================================
-# 基本设置
+# RSS 源
 # =========================================================
 
-BASE_URL = "https://t66y.com/"
-
-LIST_URL = (
-    "https://t66y.com/thread0806.php"
-    "?fid=2&search=219675"
-)
+SOURCES = [
+    {
+        "id": "asia_uncensored_original",
+        "name": "亚洲无码原创区",
+        "url": "https://t66y.com/thread0806.php?fid=2&search=219675",
+        "min_pages": 47,
+    },
+    {
+        "id": "western_original",
+        "name": "欧美原创区",
+        "url": "https://t66y.com/thread0806.php?fid=4&search=219675",
+        "min_pages": 23,
+    },
+    {
+        "id": "china_original",
+        "name": "国产原创区",
+        "url": "https://t66y.com/thread0806.php?fid=25&search=219675",
+        "min_pages": 5,
+    },
+]
 
 TARGET_AUTHOR = "愛在黑夜"
+DATA_DIR = "data"
 
-CACHE_FILE = "posts_cache.json"
-STATE_FILE = "rss_state.json"
-FEED_FILE = "feed.xml"
+# 三个分类共享，每轮最多补抓 450 篇历史正文。
+# 真正的新帖不占这 450 篇额度。
+GLOBAL_BACKFILL_BATCH_SIZE = 450
 
-# 已经确认目前至少有 47 页。
-# 如果以后网站显示 48、49……会自动取更大的页数。
-MIN_TOTAL_PAGES = 47
+SITE_TZ = timezone(timedelta(hours=8))
 
-# 每次运行：
-# 新帖全部优先抓取，不占这 400 篇额度。
-# 新帖处理完成后，再补 400 篇历史正文。
-BACKFILL_BATCH_SIZE = 400
-
-# 网站时间按 UTC+8
-SITE_TZ = timezone(
-    timedelta(hours=8)
-)
-
-# 列表页请求间隔
 PAGE_DELAY = 1.0
-
-# 详情页请求间隔
 POST_DELAY = 1.0
 
-# 每处理多少篇详情页额外休息一下
 DETAIL_PAUSE_EVERY = 50
-
-# 额外休息秒数
 DETAIL_PAUSE_SECONDS = 8
 
-# 列表页最多重试次数
 MAX_LIST_RETRIES = 5
-
-# 普通详情页错误最多跨运行尝试次数
 MAX_DETAIL_FAILURES = 3
-
-# 如果连续出现多个 403，
-# 认为网站可能正在限流，本轮停止详情抓取。
 MAX_CONSECUTIVE_403 = 3
 
-# RSS 保留数量
-# None = 全部保留
 RSS_MAX_ITEMS = None
 
 
 # =========================================================
-# HTTP Session
+# HTTP
 # =========================================================
 
 session = requests.Session()
-
 session.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/130.0 Safari/537.36"
     ),
-    "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": (
-        "zh-CN,zh;q=0.9,en;q=0.8"
-    ),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 })
 
 
@@ -95,139 +84,115 @@ class ForbiddenError(Exception):
     pass
 
 
-# =========================================================
-# HTTP 请求
-# =========================================================
+class SourceScanError(Exception):
+    pass
+
 
 def get_soup(url, retries=3):
-
     last_error = None
 
-    for attempt in range(
-        1,
-        retries + 1
-    ):
-
+    for attempt in range(1, retries + 1):
         try:
+            print(f"请求：{url}")
 
-            print(
-                f"请求：{url}"
-            )
+            r = session.get(url, timeout=30)
 
-            response = session.get(
-                url,
-                timeout=30
-            )
+            if r.status_code == 403:
+                raise ForbiddenError(url)
 
-            # 403 不在同一次请求中反复撞网站
-            if response.status_code == 403:
+            r.raise_for_status()
 
-                raise ForbiddenError(
-                    url
-                )
+            if not r.encoding or r.encoding.lower() == "iso-8859-1":
+                r.encoding = r.apparent_encoding or "utf-8"
 
-            response.raise_for_status()
-
-            if (
-                not response.encoding
-                or response.encoding.lower()
-                == "iso-8859-1"
-            ):
-
-                response.encoding = (
-                    response.apparent_encoding
-                    or "utf-8"
-                )
-
-            return BeautifulSoup(
-                response.text,
-                "html.parser"
-            )
+            return BeautifulSoup(r.text, "html.parser")
 
         except ForbiddenError:
             raise
 
         except Exception as e:
-
             last_error = e
-
-            print(
-                f"请求失败 "
-                f"{attempt}/{retries}：{e}"
-            )
-
-            time.sleep(
-                4 * attempt
-            )
+            print(f"请求失败 {attempt}/{retries}：{e}")
+            time.sleep(4 * attempt)
 
     raise last_error
 
 
 # =========================================================
-# 状态文件
+# 路径
 # =========================================================
 
-def load_state():
+def safe_name(name):
+    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "feed"
 
-    if not os.path.exists(
-        STATE_FILE
-    ):
 
-        return {
-            "initialized": False
-        }
+def source_paths(source):
+    name = safe_name(source["name"])
+    folder = os.path.join(DATA_DIR, name)
+
+    return {
+        "dir": folder,
+        "feed": os.path.join(folder, f"{name}_feed.xml"),
+        "cache": os.path.join(folder, f"{name}_posts_cache.json"),
+        "state": os.path.join(folder, f"{name}_rss_state.json"),
+    }
+
+
+def ensure_source_dir(source):
+    paths = source_paths(source)
+    os.makedirs(paths["dir"], exist_ok=True)
+    return paths
+
+
+# =========================================================
+# 迁移旧版亚洲无码原创区数据
+# =========================================================
+
+def maybe_migrate_legacy_asia(source):
+    if source["id"] != "asia_uncensored_original":
+        return
+
+    paths = ensure_source_dir(source)
+
+    if not os.path.exists(paths["cache"]) and os.path.exists("posts_cache.json"):
+        print("发现旧 posts_cache.json，迁移到「亚洲无码原创区」。")
+        shutil.copy2("posts_cache.json", paths["cache"])
+
+    if not os.path.exists(paths["state"]) and os.path.exists("rss_state.json"):
+        print("发现旧 rss_state.json，迁移到「亚洲无码原创区」。")
+        shutil.copy2("rss_state.json", paths["state"])
+
+
+# =========================================================
+# JSON
+# =========================================================
+
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
 
     try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            data = json.load(f)
-
-        if not isinstance(
-            data,
-            dict
-        ):
-
-            return {
-                "initialized": False
-            }
-
-        return data
-
-    except Exception:
-
-        return {
-            "initialized": False
-        }
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"读取 {path} 失败：{e}")
+        return default
 
 
-def save_state(state):
+def atomic_save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    temp_file = (
-        STATE_FILE + ".tmp"
-    )
+    temp_path = path + ".tmp"
 
-    with open(
-        temp_file,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
+    with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(
-            state,
+            data,
             f,
             ensure_ascii=False,
-            indent=2
+            indent=2,
         )
 
-    os.replace(
-        temp_file,
-        STATE_FILE
-    )
+    os.replace(temp_path, path)
 
 
 # =========================================================
@@ -246,412 +211,271 @@ VALID_STATUSES = {
 
 
 def normalize_cache(cache):
-    """
-    兼容前面几版生成过的 posts_cache.json。
-    """
-
-    if not isinstance(
-        cache,
-        dict
-    ):
-
+    if not isinstance(cache, dict):
         return {}
 
-    for url, item in list(
-        cache.items()
-    ):
-
-        if not isinstance(
-            item,
-            dict
-        ):
-
+    for url, item in list(cache.items()):
+        if not isinstance(item, dict):
             cache[url] = {
                 "title": "",
                 "url": url,
                 "published": None,
                 "content": "",
                 "status": "index_only",
-                "fail_count": 0
+                "fail_count": 0,
             }
-
             continue
 
-        item.setdefault(
-            "url",
-            url
-        )
+        item.setdefault("url", url)
+        item.setdefault("title", "")
+        item.setdefault("published", None)
+        item.setdefault("content", "")
+        item.setdefault("fail_count", 0)
 
-        item.setdefault(
-            "title",
-            ""
-        )
+        status = item.get("status")
 
-        item.setdefault(
-            "published",
-            None
-        )
-
-        item.setdefault(
-            "content",
-            ""
-        )
-
-        item.setdefault(
-            "fail_count",
-            0
-        )
-
-        status = item.get(
-            "status"
-        )
-
-        # 旧版 retry
         if status == "retry":
-
-            item["status"] = (
-                "retry_history"
-            )
-
+            item["status"] = "retry_history"
             continue
 
         if status in VALID_STATUSES:
             continue
 
-        # 兼容以前的 blocked 字段
-        if item.get(
-            "blocked"
-        ):
-
-            item["status"] = (
-                "blocked"
-            )
-
+        if item.get("blocked"):
+            item["status"] = "blocked"
             continue
 
-        # 兼容以前的 ok 字段
-        if item.get(
-            "ok"
-        ) is True:
+        if item.get("ok") is True:
+            content = item.get("content", "")
 
-            content = item.get(
-                "content",
-                ""
-            )
-
-            # 判断是不是旧版历史占位内容
             if (
                 "历史索引" in content
                 or "等待抓取" in content
                 or not content
             ):
-
-                item["status"] = (
-                    "index_only"
-                )
-
+                item["status"] = "index_only"
             else:
-
-                item["status"] = (
-                    "full"
-                )
+                item["status"] = "full"
 
             continue
 
-        if item.get(
-            "ok"
-        ) is False:
-
-            item["status"] = (
-                "retry_history"
-            )
-
+        if item.get("ok") is False:
+            item["status"] = "retry_history"
             continue
 
-        item["status"] = (
-            "index_only"
-        )
+        item["status"] = "index_only"
 
     return cache
 
 
-def load_cache():
+def load_cache(source):
+    paths = ensure_source_dir(source)
 
-    if not os.path.exists(
-        CACHE_FILE
-    ):
-
-        print()
-        print(
-            "没有历史缓存。"
-        )
-
-        return {}
-
-    try:
-
-        with open(
-            CACHE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            cache = json.load(f)
-
-        cache = normalize_cache(
-            cache
-        )
-
-        print()
-        print(
-            f"读取历史缓存："
-            f"{len(cache)} 篇"
-        )
-
-        return cache
-
-    except Exception as e:
-
-        print(
-            f"缓存读取失败：{e}"
-        )
-
-        return {}
-
-
-def save_cache(cache):
-
-    temp_file = (
-        CACHE_FILE + ".tmp"
+    cache = normalize_cache(
+        load_json(paths["cache"], {})
     )
 
-    with open(
-        temp_file,
-        "w",
-        encoding="utf-8"
-    ) as f:
+    print(f"[{source['name']}] 读取缓存：{len(cache)} 篇")
+    return cache
 
-        json.dump(
-            cache,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
 
-    os.replace(
-        temp_file,
-        CACHE_FILE
+def save_cache(source, cache):
+    paths = source_paths(source)
+    atomic_save_json(paths["cache"], cache)
+
+    print(f"[{source['name']}] 缓存已保存：{len(cache)} 篇")
+
+
+# =========================================================
+# 状态
+# =========================================================
+
+def load_state(source):
+    paths = ensure_source_dir(source)
+
+    state = load_json(
+        paths["state"],
+        {"initialized": False},
     )
 
-    print(
-        f"缓存已保存："
-        f"{len(cache)} 篇"
+    if not isinstance(state, dict):
+        state = {"initialized": False}
+
+    state.setdefault("initialized", False)
+    return state
+
+
+def save_state(source, state):
+    atomic_save_json(
+        source_paths(source)["state"],
+        state,
     )
 
 
 # =========================================================
-# 分页
+# 分页 URL
 # =========================================================
 
-def make_page_url(page):
+def make_page_url(source, page):
+    parsed = urlparse(source["url"])
 
-    if page == 1:
+    query = dict(
+        parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        )
+    )
 
-        return LIST_URL
+    if page <= 1:
+        query.pop("page", None)
+    else:
+        query["page"] = str(page)
 
-    return (
-        "https://t66y.com/thread0806.php"
-        f"?fid=2&page={page}&search=219675"
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(query),
+            parsed.fragment,
+        )
     )
 
 
-def get_total_pages():
+def same_source_query(source, href):
+    source_parsed = urlparse(source["url"])
+    source_query = parse_qs(source_parsed.query)
 
-    print()
-    print(
-        "正在检测总页数……"
-    )
+    full_url = urljoin(source["url"], href)
+    parsed = urlparse(full_url)
+    query = parse_qs(parsed.query)
+
+    if parsed.path != source_parsed.path:
+        return False
+
+    for key in ("fid", "search"):
+        expected = source_query.get(key, [None])[0]
+        actual = query.get(key, [None])[0]
+
+        if expected is not None and actual != expected:
+            return False
+
+    return True
+
+
+# =========================================================
+# 总页数
+# =========================================================
+
+def get_total_pages(source):
+    print(f"[{source['name']}] 正在检测总页数……")
 
     pages = {1}
 
     try:
+        soup = get_soup(source["url"])
 
-        soup = get_soup(
-            LIST_URL
-        )
-
-        for a in soup.find_all(
-            "a",
-            href=True
-        ):
-
+        for a in soup.find_all("a", href=True):
             try:
+                href = a["href"]
 
-                full_url = urljoin(
-                    BASE_URL,
-                    a["href"]
-                )
-
-                parsed = urlparse(
-                    full_url
-                )
-
-                query = parse_qs(
-                    parsed.query
-                )
-
-                if (
-                    query.get(
-                        "fid",
-                        [""]
-                    )[0]
-                    != "2"
-                ):
-
+                if not same_source_query(source, href):
                     continue
 
-                if (
-                    query.get(
-                        "search",
-                        [""]
-                    )[0]
-                    != "219675"
-                ):
-
-                    continue
+                full_url = urljoin(source["url"], href)
+                query = parse_qs(urlparse(full_url).query)
 
                 if "page" not in query:
                     continue
 
-                page = int(
-                    query["page"][0]
-                )
+                page = int(query["page"][0])
 
                 if page >= 1:
-
-                    pages.add(
-                        page
-                    )
+                    pages.add(page)
 
             except Exception:
                 continue
 
     except Exception as e:
+        print(f"[{source['name']}] 自动检测页数失败：{e}")
 
-        print(
-            f"自动检测页数失败：{e}"
-        )
-
-    detected = max(
-        pages
-    )
+    detected = max(pages)
 
     total = max(
         detected,
-        MIN_TOTAL_PAGES
+        int(source.get("min_pages", 1)),
     )
 
     print(
-        f"网页检测页数：{detected}"
-    )
-
-    print(
-        f"本次完整扫描："
-        f"1～{total} 页"
+        f"[{source['name']}] "
+        f"网页检测：{detected} 页；"
+        f"本次扫描：1～{total} 页"
     )
 
     return total
 
 
 # =========================================================
-# 单个列表页
+# 列表页
 # =========================================================
 
-def get_posts_from_page(page):
-
+def get_posts_from_page(source, page):
     soup = get_soup(
-        make_page_url(
-            page
-        )
+        make_page_url(source, page)
     )
 
     posts = []
+    seen = set()
 
-    page_seen = set()
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
 
-    for a in soup.find_all(
-        "a",
-        href=True
-    ):
-
-        href = a.get(
-            "href",
-            ""
-        )
-
-        # 只处理主题详情链接
         if "htm_data" not in href:
             continue
 
-        title = a.get_text(
-            " ",
-            strip=True
-        )
+        title = a.get_text(" ", strip=True)
 
         if not title:
             continue
 
-        full_url = urljoin(
-            BASE_URL,
-            href
-        )
+        url = urljoin(source["url"], href)
 
-        if full_url in page_seen:
+        if url in seen:
             continue
 
-        page_seen.add(
-            full_url
-        )
+        seen.add(url)
 
         posts.append({
             "title": title,
-            "url": full_url
+            "url": url,
         })
 
     return posts
 
 
 def fetch_list_page(
+    source,
     page,
-    previous_signature=None
+    previous_signature=None,
 ):
-
     for attempt in range(
         1,
-        MAX_LIST_RETRIES + 1
+        MAX_LIST_RETRIES + 1,
     ):
-
         try:
-
-            posts = (
-                get_posts_from_page(
-                    page
-                )
+            posts = get_posts_from_page(
+                source,
+                page,
             )
 
             if not posts:
-
                 print(
-                    f"⚠️ 第 {page} 页"
-                    "返回 0 条，"
-                    f"重试 {attempt}/"
-                    f"{MAX_LIST_RETRIES}"
+                    f"[{source['name']}] "
+                    f"第 {page} 页返回 0 条，"
+                    f"重试 {attempt}/{MAX_LIST_RETRIES}"
                 )
-
-                time.sleep(
-                    attempt * 5
-                )
-
+                time.sleep(attempt * 5)
                 continue
 
             signature = tuple(
@@ -659,180 +483,97 @@ def fetch_list_page(
                 for post in posts
             )
 
-            # 防止网站异常返回上一页
             if (
                 previous_signature
-                and signature
-                == previous_signature
+                and signature == previous_signature
             ):
-
                 print(
-                    f"⚠️ 第 {page} 页"
-                    "疑似重复上一页，"
-                    "重新请求。"
+                    f"[{source['name']}] "
+                    f"第 {page} 页疑似重复上一页，"
+                    f"重试 {attempt}/{MAX_LIST_RETRIES}"
                 )
-
-                time.sleep(
-                    attempt * 5
-                )
-
+                time.sleep(attempt * 5)
                 continue
 
-            return (
-                posts,
-                signature
-            )
+            return posts, signature
 
         except ForbiddenError:
-
             print(
-                f"⛔ 第 {page} 个"
-                "列表页返回 403"
+                f"[{source['name']}] "
+                f"第 {page} 个列表页返回 403"
             )
-
-            return (
-                None,
-                None
-            )
+            return None, None
 
         except Exception as e:
-
             print(
-                f"⚠️ 第 {page} 页失败 "
-                f"{attempt}/"
-                f"{MAX_LIST_RETRIES}："
-                f"{e}"
+                f"[{source['name']}] "
+                f"第 {page} 页失败 "
+                f"{attempt}/{MAX_LIST_RETRIES}：{e}"
             )
+            time.sleep(attempt * 5)
 
-            time.sleep(
-                attempt * 5
-            )
-
-    return (
-        None,
-        None
-    )
+    return None, None
 
 
-# =========================================================
-# 完整扫描所有列表页
-# =========================================================
-
-def collect_all_list_posts():
-
-    total_pages = (
-        get_total_pages()
-    )
+def collect_all_list_posts(source):
+    total_pages = get_total_pages(source)
 
     all_posts = []
-
     seen_urls = set()
-
     failed_pages = []
-
     previous_signature = None
 
     for page in range(
         1,
-        total_pages + 1
+        total_pages + 1,
     ):
-
-        print()
         print(
-            "=" * 60
+            f"[{source['name']}] "
+            f"正在扫描 {page}/{total_pages} 页"
         )
 
-        print(
-            f"正在扫描 "
-            f"{page}/{total_pages} 页"
-        )
-
-        print(
-            "=" * 60
-        )
-
-        posts, signature = (
-            fetch_list_page(
-                page,
-                previous_signature
-            )
+        posts, signature = fetch_list_page(
+            source,
+            page,
+            previous_signature,
         )
 
         if not posts:
+            failed_pages.append(page)
 
             print(
-                f"❌ 第 {page} 页"
-                "第一次扫描失败。"
-            )
-
-            print(
-                "先继续扫描后面的页面。"
-            )
-
-            failed_pages.append(
-                page
+                f"[{source['name']}] "
+                f"第 {page} 页第一次失败，"
+                "先继续后面的页面"
             )
 
             continue
 
-        previous_signature = (
-            signature
-        )
+        previous_signature = signature
 
         added = 0
 
         for post in posts:
-
-            url = post["url"]
-
-            if url in seen_urls:
+            if post["url"] in seen_urls:
                 continue
 
-            seen_urls.add(
-                url
-            )
-
-            all_posts.append(
-                post
-            )
-
+            seen_urls.add(post["url"])
+            all_posts.append(post)
             added += 1
 
         print(
-            f"第 {page}/{total_pages} 页："
-            f"{len(posts)} 条"
+            f"[{source['name']}] "
+            f"本页 {len(posts)} 条；"
+            f"新增 {added}；"
+            f"累计 {len(all_posts)}"
         )
 
-        print(
-            f"新增 {added} 条，"
-            f"累计 {len(all_posts)} 条"
-        )
-
-        time.sleep(
-            PAGE_DELAY
-        )
-
-    # =====================================================
-    # 第二轮补抓失败页
-    # =====================================================
+        time.sleep(PAGE_DELAY)
 
     if failed_pages:
-
-        print()
         print(
-            "=" * 60
-        )
-
-        print(
-            "开始补抓失败页面："
-        )
-
-        print(
-            failed_pages
-        )
-
-        print(
-            "=" * 60
+            f"[{source['name']}] "
+            f"开始补抓失败页面：{failed_pages}"
         )
 
         time.sleep(15)
@@ -840,145 +581,73 @@ def collect_all_list_posts():
         still_failed = []
 
         for page in failed_pages:
-
-            posts, _ = (
-                fetch_list_page(
-                    page,
-                    None
-                )
+            posts, _ = fetch_list_page(
+                source,
+                page,
+                None,
             )
 
             if not posts:
-
-                still_failed.append(
-                    page
-                )
-
+                still_failed.append(page)
                 continue
 
-            added = 0
-
             for post in posts:
+                if post["url"] not in seen_urls:
+                    seen_urls.add(post["url"])
+                    all_posts.append(post)
 
-                if (
-                    post["url"]
-                    in seen_urls
-                ):
+            time.sleep(PAGE_DELAY)
 
-                    continue
-
-                seen_urls.add(
-                    post["url"]
-                )
-
-                all_posts.append(
-                    post
-                )
-
-                added += 1
-
-            print(
-                f"✓ 第 {page} 页"
-                f"补抓成功，"
-                f"新增 {added} 条"
-            )
-
-            time.sleep(
-                PAGE_DELAY
-            )
-
-        # 有页面彻底失败就不更新 RSS
         if still_failed:
-
-            raise RuntimeError(
-                "以下列表页经过两轮重试"
-                "仍然无法读取："
-                f"{still_failed}。"
-                "为了避免生成残缺 RSS，"
-                "本次停止更新。"
+            raise SourceScanError(
+                f"[{source['name']}] "
+                "以下页面两轮重试后仍失败："
+                f"{still_failed}"
             )
 
-    print()
     print(
-        "=" * 60
+        f"[{source['name']}] "
+        f"扫描完成，共 {len(all_posts)} 个不重复帖子"
     )
 
-    print(
-        f"全部 {total_pages} 页"
-        "扫描完成"
-    )
-
-    print(
-        f"共发现 "
-        f"{len(all_posts)} 个"
-        "不重复帖子"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    return all_posts
+    return all_posts, total_pages
 
 
 # =========================================================
-# 发布时间
+# 发帖时间
 # =========================================================
 
 def infer_year_from_url(
     post_url,
-    fallback_month
+    fallback_month,
 ):
-
-    # 示例：
-    #
-    # /htm_data/2403/2/6236255.html
-    #
-    # 2403 = 2024 年 03 月
-
     match = re.search(
-        r"htm_data/"
-        r"(\d{2})(\d{2})/",
-        post_url
+        r"htm_data/(\d{2})(\d{2})/",
+        post_url,
     )
 
     if match:
-
-        yy = int(
-            match.group(1)
-        )
-
-        mm = int(
-            match.group(2)
-        )
+        yy = int(match.group(1))
+        mm = int(match.group(2))
 
         if 1 <= mm <= 12:
+            return 2000 + yy
 
-            return (
-                2000 + yy
-            )
-
-    now = datetime.now(
-        SITE_TZ
-    )
-
-    year = now.year
+    now = datetime.now(SITE_TZ)
 
     if fallback_month > now.month:
+        return now.year - 1
 
-        year -= 1
-
-    return year
+    return now.year
 
 
 def parse_publish_time(
     soup,
-    post_url
+    post_url,
 ):
-
     text = soup.get_text(
         " ",
-        strip=True
+        strip=True,
     )
 
     patterns = [
@@ -991,109 +660,93 @@ def parse_publish_time(
             r"發表於[:：]?\s*"
             r"(\d{2})-(\d{2})\s+"
             r"(\d{2}):(\d{2})"
-        )
+        ),
     ]
 
     match = None
 
     for pattern in patterns:
-
         match = re.search(
             pattern,
             text,
-            re.I
+            re.I,
         )
 
         if match:
             break
 
     if not match:
-
         return None
 
     month, day, hour, minute = map(
         int,
-        match.groups()
+        match.groups(),
     )
 
     year = infer_year_from_url(
         post_url,
-        month
+        month,
     )
 
     try:
-
         return datetime(
             year,
             month,
             day,
             hour,
             minute,
-            tzinfo=SITE_TZ
+            tzinfo=SITE_TZ,
         )
-
     except ValueError:
-
         return None
 
 
 # =========================================================
-# 正文清理
+# 正文
 # =========================================================
 
 def clean_content(
     node,
-    post_url
+    post_url,
 ):
-
     if node is None:
-
         return ""
 
-    for bad in node.find_all([
-        "script",
-        "style",
-        "iframe",
-        "noscript"
-    ]):
-
+    for bad in node.find_all(
+        [
+            "script",
+            "style",
+            "iframe",
+            "noscript",
+        ]
+    ):
         bad.decompose()
 
-    # 图片地址改成绝对地址
-    for img in node.find_all(
-        "img"
-    ):
-
-        src = img.get(
-            "src"
-        )
+    for img in node.find_all("img"):
+        src = img.get("src")
 
         if src:
-
             img["src"] = urljoin(
                 post_url,
-                src
+                src,
             )
 
         img.attrs.pop(
             "onclick",
-            None
+            None,
         )
-
         img.attrs.pop(
             "onload",
-            None
+            None,
         )
 
-    # 正文里的超链接也改成绝对地址
     for a in node.find_all(
         "a",
-        href=True
+        href=True,
     ):
-
         a["href"] = urljoin(
             post_url,
-            a["href"]
+            a["href"],
         )
 
     return str(node)
@@ -1101,76 +754,61 @@ def clean_content(
 
 def find_main_content(
     soup,
-    post_url
+    post_url,
 ):
-
-    # 这种老论坛常见楼主正文 ID
-    for element_id in [
+    for element_id in (
         "read_tpc",
-        "read_tpc_0"
-    ]:
-
+        "read_tpc_0",
+    ):
         node = soup.find(
             id=element_id
         )
 
         if node:
-
             return clean_content(
                 node,
-                post_url
+                post_url,
             )
 
-    selectors = [
+    for selector in (
         ".tpc_content",
         ".post_content",
-        ".post-content"
-    ]
-
-    for selector in selectors:
-
+        ".post-content",
+    ):
         node = soup.select_one(
             selector
         )
 
         if node:
-
             return clean_content(
                 node,
-                post_url
+                post_url,
             )
 
     return ""
 
 
 # =========================================================
-# 单篇详情
+# 详情页
 # =========================================================
 
 def fetch_post_detail(post):
-
     try:
-
         soup = get_soup(
             post["url"]
         )
 
-        published = (
-            parse_publish_time(
-                soup,
-                post["url"]
-            )
+        published = parse_publish_time(
+            soup,
+            post["url"],
         )
 
-        content = (
-            find_main_content(
-                soup,
-                post["url"]
-            )
+        content = find_main_content(
+            soup,
+            post["url"],
         )
 
         if not content:
-
             content = (
                 "<p>"
                 "正文没有成功自动提取，"
@@ -1180,136 +818,92 @@ def fetch_post_detail(post):
 
         return {
             "type": "success",
-
             "published": (
                 published.isoformat()
                 if published
                 else None
             ),
-
-            "content": content
+            "content": content,
         }
 
     except ForbiddenError:
-
         print(
-            "⛔ 详情页返回 403："
-        )
-
-        print(
-            post["url"]
+            f"⛔ 详情页返回 403："
+            f"{post['url']}"
         )
 
         return {
             "type": "403",
             "published": None,
-            "content": ""
+            "content": "",
         }
 
     except Exception as e:
-
         print(
-            f"⚠️ 详情页异常：{e}"
+            f"⚠️ 详情页异常："
+            f"{post['url']}：{e}"
         )
 
         return {
             "type": "error",
             "published": None,
-            "content": ""
+            "content": "",
         }
 
 
 # =========================================================
-# 建立历史索引
+# 缓存同步
 # =========================================================
 
 def make_index_item(post):
-
     return {
         "title": post["title"],
         "url": post["url"],
-
         "published": None,
-
         "content": (
             "<p>"
             "历史帖子正文尚未抓取。"
             "</p>"
         ),
-
         "status": "index_only",
-
-        "fail_count": 0
+        "fail_count": 0,
     }
 
-
-# =========================================================
-# 同步列表 -> 缓存
-# =========================================================
 
 def sync_list_to_cache(
     list_posts,
     cache,
-    baseline_mode
+    baseline_mode,
 ):
-
     new_count = 0
 
     for post in list_posts:
-
         url = post["url"]
 
-        # 已经存在
         if url in cache:
-
-            cache[url][
-                "title"
-            ] = post["title"]
-
-            cache[url][
-                "url"
-            ] = url
-
+            cache[url]["title"] = (
+                post["title"]
+            )
+            cache[url]["url"] = url
             continue
-
-        # =================================================
-        # 第一次运行这一新版程序：
-        #
-        # 当前网站上已经存在的几千篇，
-        # 全部视为历史基准，
-        # 绝不能当成几千篇“新帖”。
-        # =================================================
 
         if baseline_mode:
-
-            cache[url] = (
-                make_index_item(
-                    post
-                )
+            cache[url] = make_index_item(
+                post
             )
-
             continue
-
-        # =================================================
-        # 初始化完成之后出现的新 URL
-        # 才是真正的新帖子
-        # =================================================
 
         cache[url] = {
             "title": post["title"],
             "url": url,
-
             "published": None,
-
             "content": (
                 "<p>"
                 "新帖正文等待抓取。"
                 "</p>"
             ),
-
             "status": "pending_new",
-
-            "fail_count": 0
+            "fail_count": 0,
         }
 
         new_count += 1
@@ -1317,145 +911,82 @@ def sync_list_to_cache(
     return new_count
 
 
-# =========================================================
-# 把详情结果写回缓存
-# =========================================================
-
 def apply_detail_result(
     post,
     result,
     cache,
-    is_new
+    is_new,
 ):
-
     url = post["url"]
+    old_item = cache.get(url, {})
 
-    old_item = cache.get(
-        url,
-        {}
+    old_published = old_item.get(
+        "published"
+    )
+    old_content = old_item.get(
+        "content",
+        "",
     )
 
-    old_published = (
-        old_item.get(
-            "published"
-        )
-    )
-
-    old_content = (
-        old_item.get(
-            "content",
-            ""
-        )
-    )
-
-    # =====================================================
-    # 成功
-    # =====================================================
-
-    if (
-        result["type"]
-        == "success"
-    ):
-
+    if result["type"] == "success":
         cache[url] = {
             "title": post["title"],
             "url": url,
-
             "published": (
-                result.get(
-                    "published"
-                )
+                result.get("published")
                 or old_published
             ),
-
             "content": (
-                result.get(
-                    "content"
-                )
+                result.get("content")
                 or old_content
             ),
-
             "status": "full",
-
-            "fail_count": 0
+            "fail_count": 0,
         }
 
         return "success"
 
-    # =====================================================
-    # 403
-    # =====================================================
-
-    if (
-        result["type"]
-        == "403"
-    ):
-
+    if result["type"] == "403":
         cache[url] = {
             "title": post["title"],
             "url": url,
-
-            "published": (
-                old_published
-            ),
-
+            "published": old_published,
             "content": (
                 "<p>"
                 "该详情页返回 403，"
-                "没有继续自动访问。"
+                "目前只保留标题和原帖链接。"
                 "</p>"
             ),
-
-            # 以后不会每 10 分钟重复撞这个 URL
             "status": "blocked",
-
-            "fail_count": (
-                old_item.get(
-                    "fail_count",
-                    0
-                )
-            )
+            "fail_count": old_item.get(
+                "fail_count",
+                0,
+            ),
         }
 
         return "403"
 
-    # =====================================================
-    # 普通临时错误
-    # =====================================================
-
     fail_count = (
         old_item.get(
             "fail_count",
-            0
+            0,
         )
         + 1
     )
 
-    if (
-        fail_count
-        >= MAX_DETAIL_FAILURES
-    ):
-
+    if fail_count >= MAX_DETAIL_FAILURES:
         status = "failed"
-
     else:
-
-        if is_new:
-
-            status = "retry_new"
-
-        else:
-
-            status = "retry_history"
+        status = (
+            "retry_new"
+            if is_new
+            else "retry_history"
+        )
 
     cache[url] = {
         "title": post["title"],
         "url": url,
-
-        "published": (
-            old_published
-        ),
-
+        "published": old_published,
         "content": (
             old_content
             or
@@ -1463,39 +994,28 @@ def apply_detail_result(
             "正文暂时读取失败。"
             "</p>"
         ),
-
         "status": status,
-
-        "fail_count": (
-            fail_count
-        )
+        "fail_count": fail_count,
     }
 
     return "error"
 
 
 # =========================================================
-# 详情请求节流
+# 节流
 # =========================================================
 
 def detail_pause(index):
-
-    time.sleep(
-        POST_DELAY
-    )
+    time.sleep(POST_DELAY)
 
     if (
         index > 0
-        and index
-        % DETAIL_PAUSE_EVERY
-        == 0
+        and index % DETAIL_PAUSE_EVERY == 0
     ):
-
-        print()
         print(
             f"已处理 {index} 篇详情，"
             f"额外休息 "
-            f"{DETAIL_PAUSE_SECONDS} 秒。"
+            f"{DETAIL_PAUSE_SECONDS} 秒"
         )
 
         time.sleep(
@@ -1504,462 +1024,198 @@ def detail_pause(index):
 
 
 # =========================================================
-# 优先处理新帖子
+# 初始化分类
 # =========================================================
 
-def process_new_posts(
+def prepare_source(
+    source,
     list_posts,
-    cache
+    total_pages,
 ):
-
-    priority_posts = []
-
-    for post in list_posts:
-
-        item = cache.get(
-            post["url"],
-            {}
-        )
-
-        status = item.get(
-            "status"
-        )
-
-        if status in {
-            "pending_new",
-            "retry_new"
-        }:
-
-            priority_posts.append(
-                post
-            )
-
-    print()
-    print(
-        "=" * 60
+    maybe_migrate_legacy_asia(
+        source
     )
 
-    print(
-        f"本次需要优先处理的新帖："
-        f"{len(priority_posts)} 篇"
+    cache = load_cache(
+        source
     )
 
-    print(
-        "=" * 60
+    state = load_state(
+        source
     )
-
-    consecutive_403 = 0
-
-    total = len(
-        priority_posts
-    )
-
-    for index, post in enumerate(
-        priority_posts,
-        start=1
-    ):
-
-        print()
-        print(
-            f"[新帖 "
-            f"{index}/{total}] "
-            f"{post['title']}"
-        )
-
-        result = (
-            fetch_post_detail(
-                post
-            )
-        )
-
-        outcome = (
-            apply_detail_result(
-                post,
-                result,
-                cache,
-                is_new=True
-            )
-        )
-
-        if outcome == "403":
-
-            consecutive_403 += 1
-
-        else:
-
-            consecutive_403 = 0
-
-        # 新帖尽量及时保存进度
-        if (
-            index % 10
-            == 0
-        ):
-
-            save_cache(
-                cache
-            )
-
-        # 连续 403 说明很可能正在限流
-        if (
-            consecutive_403
-            >= MAX_CONSECUTIVE_403
-        ):
-
-            print()
-            print(
-                "⚠️ 连续出现多个 403。"
-            )
-
-            print(
-                "本轮停止继续请求详情页，"
-                "避免进一步触发网站限制。"
-            )
-
-            save_cache(
-                cache
-            )
-
-            return True
-
-        detail_pause(
-            index
-        )
-
-    save_cache(
-        cache
-    )
-
-    return False
-
-
-# =========================================================
-# 每轮补 400 篇历史正文
-# =========================================================
-
-def process_history_backfill(
-    list_posts,
-    cache
-):
-
-    pending_history = []
-
-    for post in list_posts:
-
-        item = cache.get(
-            post["url"],
-            {}
-        )
-
-        status = item.get(
-            "status",
-            "index_only"
-        )
-
-        if status in {
-            "index_only",
-            "retry_history"
-        }:
-
-            pending_history.append(
-                post
-            )
-
-    remaining_before = len(
-        pending_history
-    )
-
-    tasks = pending_history[
-        :BACKFILL_BATCH_SIZE
-    ]
-
-    print()
-    print(
-        "=" * 60
-    )
-
-    print(
-        f"历史正文尚未完成："
-        f"{remaining_before} 篇"
-    )
-
-    print(
-        f"本轮准备补抓："
-        f"{len(tasks)} 篇"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    consecutive_403 = 0
-
-    total = len(
-        tasks
-    )
-
-    for index, post in enumerate(
-        tasks,
-        start=1
-    ):
-
-        print()
-        print(
-            f"[历史补抓 "
-            f"{index}/{total}] "
-            f"{post['title']}"
-        )
-
-        result = (
-            fetch_post_detail(
-                post
-            )
-        )
-
-        outcome = (
-            apply_detail_result(
-                post,
-                result,
-                cache,
-                is_new=False
-            )
-        )
-
-        if outcome == "403":
-
-            consecutive_403 += 1
-
-        else:
-
-            consecutive_403 = 0
-
-        if (
-            index % 20
-            == 0
-        ):
-
-            save_cache(
-                cache
-            )
-
-        if (
-            consecutive_403
-            >= MAX_CONSECUTIVE_403
-        ):
-
-            print()
-            print(
-                "⚠️ 历史补抓连续出现多个 403。"
-            )
-
-            print(
-                "本轮提前停止，"
-                "剩余历史内容下次继续。"
-            )
-
-            break
-
-        detail_pause(
-            index
-        )
-
-    save_cache(
-        cache
-    )
-
-
-# =========================================================
-# 总更新逻辑
-# =========================================================
-
-def update_cache(
-    list_posts,
-    cache,
-    state
-):
 
     initialized = bool(
         state.get(
             "initialized",
-            False
+            False,
         )
     )
 
-    # 当前列表中，有多少 URL 已经存在缓存里
     existing_visible = sum(
         1
         for post in list_posts
         if post["url"] in cache
     )
 
-    if list_posts:
-
-        coverage = (
-            existing_visible
-            / len(list_posts)
-        )
-
-    else:
-
-        coverage = 0
-
-    # =====================================================
-    # baseline_mode：
-    #
-    # 第一次使用这套新逻辑；
-    # 或缓存被删除；
-    # 或旧缓存只覆盖了不到一半的网页。
-    #
-    # 这种情况下，
-    # 当前已有帖子全部视为历史基准，
-    # 不会当成几千篇“新帖子”。
-    # =====================================================
+    coverage = (
+        existing_visible
+        / len(list_posts)
+        if list_posts
+        else 0
+    )
 
     baseline_mode = (
         not initialized
         or not cache
-        or coverage < 0.5
+        or coverage < 0.90
     )
 
-    print()
-    print(
-        "=" * 60
+    new_count = sync_list_to_cache(
+        list_posts,
+        cache,
+        baseline_mode,
     )
 
-    print(
-        f"当前列表帖子："
-        f"{len(list_posts)} 篇"
-    )
-
-    print(
-        f"缓存中已有："
-        f"{len(cache)} 篇"
-    )
-
-    print(
-        f"当前列表缓存覆盖率："
-        f"{coverage:.1%}"
-    )
-
-    print(
-        f"初始化基准模式："
-        f"{baseline_mode}"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    new_count = (
-        sync_list_to_cache(
-            list_posts,
-            cache,
-            baseline_mode
-        )
-    )
+    state.update({
+        "initialized": True,
+        "last_scan": datetime.now(
+            SITE_TZ
+        ).isoformat(),
+        "last_total_pages": total_pages,
+        "last_list_count": len(
+            list_posts
+        ),
+    })
 
     save_cache(
-        cache
-    )
-
-    # 从这一次开始，
-    # 后续运行就可以判断什么是真正的新帖
-    state["initialized"] = True
-
-    state["baseline_count"] = len(
-        list_posts
-    )
-
-    state["last_scan"] = (
-        datetime.now(
-            SITE_TZ
-        ).isoformat()
+        source,
+        cache,
     )
 
     save_state(
-        state
+        source,
+        state,
     )
 
-    if baseline_mode:
-
-        print()
-        print(
-            "当前网站已有内容"
-            "已经建立为历史基准。"
-        )
-
-        print(
-            "本轮不会把它们全部当成新帖。"
-        )
-
-    else:
-
-        print()
-        print(
-            f"本次发现真正的新 URL："
-            f"{new_count} 篇"
-        )
-
-    # =====================================================
-    # 第一优先级：
-    # 真正的新帖子
-    # =====================================================
-
-    site_limited = (
-        process_new_posts(
-            list_posts,
-            cache
-        )
+    print(
+        f"[{source['name']}] "
+        f"列表 {len(list_posts)}；"
+        f"缓存 {len(cache)}；"
+        f"覆盖率 {coverage:.1%}；"
+        f"基准模式 {baseline_mode}；"
+        f"真正新增 {new_count}"
     )
 
-    # 如果新帖阶段已经连续 403，
-    # 本轮不要继续补 400 篇历史。
-    if site_limited:
+    return {
+        "source": source,
+        "list_posts": list_posts,
+        "cache": cache,
+    }
 
-        print()
-        print(
-            "检测到网站可能正在限流。"
-        )
 
-        print(
-            "本轮跳过历史 400 篇补抓。"
-        )
+# =========================================================
+# 新帖优先
+# =========================================================
 
-        return cache
+def process_new_posts(context):
+    source = context["source"]
+    posts = context["list_posts"]
+    cache = context["cache"]
 
-    # =====================================================
-    # 第二优先级：
-    # 再额外补 400 篇历史正文
-    # =====================================================
+    tasks = [
+        post
+        for post in posts
+        if cache.get(
+            post["url"],
+            {},
+        ).get("status")
+        in {
+            "pending_new",
+            "retry_new",
+        }
+    ]
 
-    process_history_backfill(
-        list_posts,
-        cache
+    print(
+        f"[{source['name']}] "
+        f"优先处理新帖：{len(tasks)} 篇"
     )
 
-    return cache
+    consecutive_403 = 0
+    total = len(tasks)
+
+    for index, post in enumerate(
+        tasks,
+        start=1,
+    ):
+        print(
+            f"[{source['name']}] "
+            f"[新帖 {index}/{total}] "
+            f"{post['title']}"
+        )
+
+        result = fetch_post_detail(
+            post
+        )
+
+        outcome = apply_detail_result(
+            post,
+            result,
+            cache,
+            True,
+        )
+
+        if outcome == "403":
+            consecutive_403 += 1
+        else:
+            consecutive_403 = 0
+
+        if index % 10 == 0:
+            save_cache(
+                source,
+                cache,
+            )
+
+        if (
+            consecutive_403
+            >= MAX_CONSECUTIVE_403
+        ):
+            print(
+                f"[{source['name']}] "
+                "连续多个 403，"
+                "本轮停止详情抓取"
+            )
+
+            save_cache(
+                source,
+                cache,
+            )
+
+            return True
+
+        detail_pause(index)
+
+    save_cache(
+        source,
+        cache,
+    )
+
+    return False
 
 
 # =========================================================
 # RSS 时间解析
 # =========================================================
 
-def parse_cached_datetime(
-    value
-):
-
+def parse_cached_datetime(value):
     if not value:
-
         return None
 
     try:
-
         dt = datetime.fromisoformat(
             value
         )
 
-        # 兼容旧缓存里的无时区 datetime
         if dt.tzinfo is None:
-
             dt = dt.replace(
                 tzinfo=SITE_TZ
             )
@@ -1967,15 +1223,247 @@ def parse_cached_datetime(
         return dt
 
     except Exception:
-
         return None
+
+
+# =========================================================
+# 全局历史补抓：总共450篇，动态分配，最新优先
+# =========================================================
+
+def history_priority(
+    post,
+    item,
+    position,
+):
+    """
+    优先顺序：
+
+    1. 如果已经知道真实发布时间，用真实发布时间。
+    2. 否则从 URL 的 htm_data/YYMM 推断年月。
+    3. 同年月时，列表位置越靠前越优先。
+    """
+
+    published = parse_cached_datetime(
+        item.get("published")
+    )
+
+    if published:
+        return (
+            2,
+            published.timestamp(),
+            -position,
+        )
+
+    match = re.search(
+        r"htm_data/(\d{2})(\d{2})/",
+        post["url"],
+    )
+
+    if match:
+        year = 2000 + int(
+            match.group(1)
+        )
+
+        month = int(
+            match.group(2)
+        )
+
+        if 1 <= month <= 12:
+            rough = datetime(
+                year,
+                month,
+                1,
+                tzinfo=SITE_TZ,
+            )
+
+            return (
+                1,
+                rough.timestamp(),
+                -position,
+            )
+
+    return (
+        0,
+        0,
+        -position,
+    )
+
+
+def process_global_history_backfill(
+    contexts
+):
+    candidates = []
+
+    for context in contexts:
+        source = context["source"]
+        posts = context["list_posts"]
+        cache = context["cache"]
+
+        for position, post in enumerate(
+            posts
+        ):
+            item = cache.get(
+                post["url"],
+                {},
+            )
+
+            status = item.get(
+                "status",
+                "index_only",
+            )
+
+            if status not in {
+                "index_only",
+                "retry_history",
+            }:
+                continue
+
+            candidates.append({
+                "source": source,
+                "context": context,
+                "post": post,
+                "priority": history_priority(
+                    post,
+                    item,
+                    position,
+                ),
+            })
+
+    candidates.sort(
+        key=lambda x: x["priority"],
+        reverse=True,
+    )
+
+    tasks = candidates[
+        :GLOBAL_BACKFILL_BATCH_SIZE
+    ]
+
+    print()
+    print("=" * 70)
+
+    print(
+        f"三个分类历史待补总数："
+        f"{len(candidates)} 篇"
+    )
+
+    print(
+        f"本轮全局历史补抓："
+        f"{len(tasks)} / "
+        f"{GLOBAL_BACKFILL_BATCH_SIZE} 篇"
+    )
+
+    allocation = {}
+
+    for task in tasks:
+        name = task["source"]["name"]
+
+        allocation[name] = (
+            allocation.get(
+                name,
+                0,
+            )
+            + 1
+        )
+
+    for context in contexts:
+        name = context[
+            "source"
+        ]["name"]
+
+        print(
+            f"{name}："
+            f"{allocation.get(name, 0)} 篇"
+        )
+
+    print("=" * 70)
+
+    consecutive_403 = 0
+    source_counts = {}
+    total = len(tasks)
+
+    for index, task in enumerate(
+        tasks,
+        start=1,
+    ):
+        source = task["source"]
+        context = task["context"]
+        post = task["post"]
+        cache = context["cache"]
+
+        name = source["name"]
+
+        print(
+            f"[全局历史 "
+            f"{index}/{total}] "
+            f"[{name}] "
+            f"{post['title']}"
+        )
+
+        result = fetch_post_detail(
+            post
+        )
+
+        outcome = apply_detail_result(
+            post,
+            result,
+            cache,
+            False,
+        )
+
+        source_counts[name] = (
+            source_counts.get(
+                name,
+                0,
+            )
+            + 1
+        )
+
+        if outcome == "403":
+            consecutive_403 += 1
+        else:
+            consecutive_403 = 0
+
+        if source_counts[name] % 20 == 0:
+            save_cache(
+                source,
+                cache,
+            )
+
+        if (
+            consecutive_403
+            >= MAX_CONSECUTIVE_403
+        ):
+            print(
+                "⚠️ 连续出现多个 403，"
+                "本轮全局历史补抓提前停止。"
+            )
+            break
+
+        detail_pause(index)
+
+    for context in contexts:
+        save_cache(
+            context["source"],
+            context["cache"],
+        )
+
+    return (
+        consecutive_403
+        >= MAX_CONSECUTIVE_403
+    )
 
 
 # =========================================================
 # 生成 RSS
 # =========================================================
 
-def generate_rss(cache):
+def generate_rss(context):
+    source = context["source"]
+    cache = context["cache"]
+
+    paths = ensure_source_dir(
+        source
+    )
 
     items = list(
         cache.values()
@@ -1985,12 +1473,10 @@ def generate_rss(cache):
         1970,
         1,
         1,
-        tzinfo=SITE_TZ
+        tzinfo=SITE_TZ,
     )
 
-    # Python 排序是稳定的：
-    # 没有真实发布时间的历史条目，
-    # 会继续保持它们原来的插入顺序。
+    # 按真实发布时间倒序
     items.sort(
         key=lambda item: (
             parse_cached_datetime(
@@ -2000,11 +1486,10 @@ def generate_rss(cache):
             )
             or minimum_time
         ),
-        reverse=True
+        reverse=True,
     )
 
     if RSS_MAX_ITEMS is not None:
-
         items = items[
             :RSS_MAX_ITEMS
         ]
@@ -2012,22 +1497,24 @@ def generate_rss(cache):
     fg = FeedGenerator()
 
     fg.id(
-        LIST_URL
+        source["url"]
     )
 
     fg.title(
-        f"{TARGET_AUTHOR} - T66Y RSS"
+        f"{source['name']} "
+        f"- {TARGET_AUTHOR}"
     )
 
     fg.link(
-        href=LIST_URL,
-        rel="alternate"
+        href=source["url"],
+        rel="alternate",
     )
 
     fg.description(
-        f"{TARGET_AUTHOR} 的 RSS。"
+        f"{source['name']}："
+        f"{TARGET_AUTHOR} 的帖子 RSS。"
         "新帖优先抓取全文，"
-        "历史帖子自动分批补充正文。"
+        "历史帖子按最新优先动态补抓。"
     )
 
     fg.language(
@@ -2040,43 +1527,29 @@ def generate_rss(cache):
         )
     )
 
-    count = 0
-
-    full_count = 0
-
-    pending_count = 0
-
     for post in items:
-
-        url = post.get(
-            "url"
-        )
-
-        title = post.get(
-            "title"
-        ) or "无标题"
+        url = post.get("url")
 
         if not url:
             continue
 
         fe = fg.add_entry()
 
-        fe.id(
-            url
-        )
+        fe.id(url)
 
         fe.guid(
             url,
-            permalink=True
+            permalink=True,
         )
 
         fe.title(
-            title
+            post.get("title")
+            or "无标题"
         )
 
         fe.link(
             href=url,
-            rel="alternate"
+            rel="alternate",
         )
 
         fe.author({
@@ -2092,85 +1565,60 @@ def generate_rss(cache):
         )
 
         if published:
-
             fe.pubDate(
                 published
             )
 
         status = post.get(
             "status",
-            "index_only"
+            "index_only",
         )
 
-        content = post.get(
-            "content",
-            ""
-        )
-
-        status_text = ""
-
-        if status == "full":
-
-            full_count += 1
-
-        elif status == "index_only":
-
-            pending_count += 1
-
-            status_text = (
+        status_text = {
+            "index_only": (
                 "<p><small>"
                 "历史正文尚未补抓"
                 "</small></p>"
-            )
-
-        elif status in {
-            "pending_new",
-            "retry_new"
-        }:
-
-            pending_count += 1
-
-            status_text = (
+            ),
+            "pending_new": (
                 "<p><small>"
                 "新帖正文等待抓取"
                 "</small></p>"
-            )
-
-        elif status == "retry_history":
-
-            pending_count += 1
-
-            status_text = (
+            ),
+            "retry_new": (
+                "<p><small>"
+                "新帖正文等待重试"
+                "</small></p>"
+            ),
+            "retry_history": (
                 "<p><small>"
                 "历史正文将在后续任务中重试"
                 "</small></p>"
-            )
-
-        elif status == "blocked":
-
-            status_text = (
+            ),
+            "blocked": (
                 "<p><small>"
-                "该详情页返回 403，"
+                "详情页返回 403，"
                 "目前只保留标题和原帖链接"
                 "</small></p>"
-            )
-
-        elif status == "failed":
-
-            status_text = (
+            ),
+            "failed": (
                 "<p><small>"
-                "该详情页多次读取失败，"
+                "详情页多次读取失败，"
                 "目前只保留标题和原帖链接"
                 "</small></p>"
-            )
+            ),
+        }.get(
+            status,
+            "",
+        )
 
-        if not content:
-
-            content = (
-                "<p>"
-                "暂时没有可显示的正文。"
-                "</p>"
-            )
+        content = (
+            post.get("content")
+            or
+            "<p>"
+            "暂时没有可显示的正文。"
+            "</p>"
+        )
 
         fe.description(
             status_text
@@ -2180,40 +1628,31 @@ def generate_rss(cache):
             "<hr>"
             +
             f'<p><a href="{url}">'
-            "查看原帖"
-            "</a></p>"
+            f'查看原帖'
+            f'</a></p>'
         )
 
-        count += 1
-
     fg.rss_file(
-        FEED_FILE,
-        pretty=True
-    )
-
-    print()
-    print(
-        "=" * 60
+        paths["feed"],
+        pretty=True,
     )
 
     print(
-        f"RSS 总条目："
-        f"{count}"
+        f"[{source['name']}] "
+        f"已生成："
+        f"{paths['feed']}"
     )
 
-    print(
-        f"已获取正文："
-        f"{full_count}"
-    )
-
-    print(
-        f"仍待补充正文："
-        f"{pending_count}"
-    )
-
-    print(
-        "=" * 60
-    )
+    # 兼容原来的 /feed.xml
+    # 继续作为亚洲无码原创区 RSS
+    if (
+        source["id"]
+        == "asia_uncensored_original"
+    ):
+        shutil.copy2(
+            paths["feed"],
+            "feed.xml",
+        )
 
 
 # =========================================================
@@ -2221,60 +1660,91 @@ def generate_rss(cache):
 # =========================================================
 
 def main():
-
-    print()
     print(
-        "开始更新 RSS"
+        "开始更新多分类 RSS"
     )
 
-    cache = load_cache()
+    contexts = []
 
-    state = load_state()
+    # 第一阶段：
+    # 先扫描三个分类的全部分页
+    for source in SOURCES:
+        print()
+        print("#" * 70)
+        print(
+            f"扫描分类："
+            f"{source['name']}"
+        )
+        print("#" * 70)
 
-    # =====================================================
-    # 每次仍然完整扫描全部 47+ 个列表页，
-    # 保证可以及时发现真正的新帖子。
-    # =====================================================
+        try:
+            posts, total_pages = (
+                collect_all_list_posts(
+                    source
+                )
+            )
 
-    list_posts = (
-        collect_all_list_posts()
-    )
+            context = prepare_source(
+                source,
+                posts,
+                total_pages,
+            )
 
-    if not list_posts:
+            contexts.append(
+                context
+            )
 
+        except Exception as e:
+            print(
+                f"❌ [{source['name']}] "
+                f"本轮扫描失败，"
+                f"保留旧数据：{e}"
+            )
+
+    if not contexts:
         raise RuntimeError(
-            "没有获取到任何帖子列表，"
-            "停止更新。"
+            "三个分类本轮都扫描失败。"
         )
 
-    # =====================================================
-    # 顺序：
-    #
-    # 1. 新帖先抓
-    # 2. 新帖全部完成
-    # 3. 再补 400 篇历史
-    # =====================================================
+    # 第二阶段：
+    # 三个分类的新帖全部优先处理
+    site_limited = False
 
-    cache = update_cache(
-        list_posts,
-        cache,
-        state
-    )
+    for context in contexts:
+        limited = process_new_posts(
+            context
+        )
 
-    # =====================================================
-    # 用现有缓存生成 RSS
-    # =====================================================
+        if limited:
+            site_limited = True
+            break
 
-    generate_rss(
-        cache
-    )
+    # 第三阶段：
+    # 新帖处理完之后，
+    # 三个分类共享450篇历史补抓额度，
+    # 按最新 -> 最旧动态分配。
+    if not site_limited:
+        process_global_history_backfill(
+            contexts
+        )
+    else:
+        print(
+            "检测到网站可能正在限流，"
+            "本轮跳过历史补抓。"
+        )
+
+    # 第四阶段：
+    # 分别生成三个 RSS
+    for context in contexts:
+        generate_rss(
+            context
+        )
 
     print()
     print(
-        "本次 RSS 更新完成。"
+        "全部分类处理完成。"
     )
 
 
 if __name__ == "__main__":
-
     main()
