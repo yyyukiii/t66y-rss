@@ -32,14 +32,17 @@ jobs:
       - name: Generate RSS
         run: python rss.py
 
-      - name: Commit RSS data
+      - name: Generate Excel title lists
+        run: python json_to_xlsx.py
+
+      - name: Commit RSS and Excel data
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
           git add data
 
-          git diff --cached --quiet || git commit -m "Update RSS feeds"
+          git diff --cached --quiet || git commit -m "Update RSS and Excel data"
 
           git pull --rebase
           git push
