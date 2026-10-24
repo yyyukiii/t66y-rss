@@ -25,6 +25,12 @@ from feedgen.feed import FeedGenerator
 
 SOURCES = [
     {
+        "id": "ai_cracked_original",
+        "name": "AI破解原创区",
+        "url": "https://t66y.com/thread0806.php?fid=28&search=219675",
+        "min_pages": 1,
+    },
+    {
         "id": "asia_uncensored_original",
         "name": "亚洲无码原创区",
         "url": "https://t66y.com/thread0806.php?fid=2&search=219675",
